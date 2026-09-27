@@ -1855,6 +1855,14 @@ where
             _ => unreachable!(),
         };
         let stat_size: BlobSizeType = BlobSizeType::try_from(stat.st_size.max(0)).unwrap();
+        // A descriptor of the caller keeps the answer of its `stat`: a read moves its position.
+        let unsized_file = file_response_stream::reports_no_size(
+            is_regular,
+            stat_size as u64,
+            original_size as u64,
+        ) && auto_close
+            && self.method.has_body();
+        let sized = is_regular && !unsized_file;
         if let AnyBlob::Blob(b) = blob_ref {
             b.size.set(if is_regular {
                 stat_size
@@ -1863,18 +1871,18 @@ where
             });
         }
 
-        self.flags.set_needs_content_length(is_regular);
+        self.flags.set_needs_content_length(sized);
         let mut sendfile = SendfileContext {
             remain: blob_offset + original_size,
             offset: blob_offset,
             total: 0,
         };
-        if is_regular && auto_close {
+        if sized && auto_close {
             self.flags.set_needs_content_range(
                 sendfile.remain.saturating_sub(sendfile.offset) != stat_size,
             );
         }
-        if is_regular {
+        if sized {
             sendfile.offset = sendfile.offset.min(stat_size);
             sendfile.remain = sendfile
                 .remain
@@ -1906,7 +1914,7 @@ where
             && (original_size == crate::webcore::blob::MAX_SIZE || original_size == stat_size);
         // RFC 9110 §14.2: Range is only defined for GET (HEAD mirrors GET's headers).
         let method_allows_range = self.method == Method::GET || self.method == Method::HEAD;
-        if is_regular
+        if sized
             && method_allows_range
             && !user_handles_range
             && is_whole_file
@@ -1956,7 +1964,7 @@ where
         resp.run_corked_with_type(Self::render_metadata_corked, self.as_ctx_ptr());
 
         let sendfile = self.sendfile.get();
-        if (is_regular && sendfile.remain == 0) || !self.method.has_body() {
+        if (sized && sendfile.remain == 0) || !self.method.has_body() {
             if auto_close {
                 fd.close();
             }
@@ -1992,10 +2000,12 @@ where
             file_type,
             pollable,
             offset: sendfile.offset as u64,
-            length: if is_regular {
-                Some(sendfile.remain as u64)
+            length: if sized {
+                file_response_stream::BodyLength::Exact(sendfile.remain as u64)
+            } else if unsized_file {
+                file_response_stream::BodyLength::UpTo(original_size as u64)
             } else {
-                None
+                file_response_stream::BodyLength::ToEof
             },
             idle_timeout: server.config().idle_timeout,
             owner: file_response_stream::StreamOwner::Ctx {

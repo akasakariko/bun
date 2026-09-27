@@ -194,6 +194,13 @@ Bun.serve({
 - **Memory efficient** - Only buffers small chunks during transfer, not entire file
 - **Best for**: Large files, dynamic content, user uploads, files that change frequently
 
+Some files have content and report a size of `0`. On Linux, the files on `procfs` and `cgroupfs` do. A file route and a `Response` with a `BunFile` body from a `fetch` handler read such a file to its end:
+
+- The response has a `Content-Length` header when Bun reaches the end of the content before it sends the response headers. If not, the response has no `Content-Length` header, and over HTTP/1.1 it uses chunked transfer encoding.
+- A file route adds no `Last-Modified` header, and Bun ignores the `Range` header of the request. The size and the modification time of such a file do not describe its content.
+
+This applies to a `Bun.file(path)` that has no size yet. `file.size`, `await file.exists()`, and a read of `response.body` store the size of `0`, and the response body is then empty. Make a new `Bun.file(path)` for each response. A response to a `HEAD` request has `Content-Length: 0`.
+
 ### Directory routes
 
 To serve an entire directory tree at a URL prefix, pass `{ dir }` as the route value. The route path must end in `/*`.

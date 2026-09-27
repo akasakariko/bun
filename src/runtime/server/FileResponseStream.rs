@@ -106,11 +106,36 @@ pub(crate) struct StartOptions {
     pub pollable: bool,
     /// Byte offset into the file to begin reading from.
     pub offset: u64,
-    /// Maximum bytes to send; `None` reads to EOF. For regular files this
-    /// should be `stat.size - offset` (after Range/slice clamping).
-    pub length: Option<u64>,
+    pub length: BodyLength,
     pub idle_timeout: u8,
     pub owner: StreamOwner,
+}
+
+/// How many bytes of the file the response sends.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BodyLength {
+    /// The `Content-Length` that the caller framed the response with. For regular files this is `stat.size - offset` (after Range/slice clamping).
+    Exact(u64),
+    /// The caller framed nothing: the body runs to EOF.
+    ToEof,
+    /// As `ToEof`, and not more than this count of bytes: the window of a slice.
+    UpTo(u64),
+}
+
+impl BodyLength {
+    fn exact(self) -> Option<u64> {
+        match self {
+            Self::Exact(len) => Some(len),
+            Self::ToEof | Self::UpTo(_) => None,
+        }
+    }
+
+    fn limit(self) -> Option<usize> {
+        match self {
+            Self::Exact(len) | Self::UpTo(len) => Some(len as usize),
+            Self::ToEof => None,
+        }
+    }
 }
 
 /// Who hears about the end of the stream. Exactly one of complete / abort /
@@ -214,7 +239,7 @@ impl FileResponseStream {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 socket_fd: opts.resp.get_native_handle(),
                 offset: opts.offset,
-                remain: opts.length.expect("can_sendfile gates None"),
+                remain: opts.length.exact().expect("can_sendfile gates UpTo"),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 has_set_on_writable: false,
             });
@@ -235,7 +260,7 @@ impl FileResponseStream {
                 reader.flags.insert(ReaderFlags::SOCKET);
             }
             // The reader reports the end of the body as EOF, so `on_read_chunk` ends the response there like at a real EOF.
-            reader.set_limit(opts.length.map(|len| len as usize));
+            reader.set_limit(opts.length.limit());
             reader.set_parent(this.cast::<c_void>());
         });
 
@@ -655,7 +680,19 @@ impl Drop for FileResponseStream {
     }
 }
 
-fn can_sendfile(resp: AnyResponse, file_type: FileType, length: Option<u64>) -> bool {
+/// Whether a regular file reports no size and the response wants `window` bytes of it. procfs and cgroupfs make the content at `read`, so the body of such a file runs to EOF like the body of a pipe, with no length, Range or validator from the `stat`.
+#[inline]
+pub(crate) fn reports_no_size(is_regular: bool, st_size: u64, window: u64) -> bool {
+    st_size == 0 && has_window(is_regular, window)
+}
+
+// Cold, so that a file with a size pays the test of `st_size` only.
+#[cold]
+fn has_window(is_regular: bool, window: u64) -> bool {
+    cfg!(any(target_os = "linux", target_os = "android")) && is_regular && window > 0
+}
+
+fn can_sendfile(resp: AnyResponse, file_type: FileType, length: BodyLength) -> bool {
     // Matches the cfg on `on_sendfile`. macOS is excluded: XNU's sendfile can
     // sleep uninterruptibly under mbuf pressure, leaving the process unkillable;
     // the BufferedReader path stays non-blocking.
@@ -674,7 +711,9 @@ fn can_sendfile(resp: AnyResponse, file_type: FileType, length: Option<u64>) -> 
         if file_type != FileType::File {
             return false;
         }
-        let Some(len) = length else { return false };
+        let Some(len) = length.exact() else {
+            return false;
+        };
         // Below ~1MB the syscall + dual-readiness overhead doesn't pay off.
         len >= (1 << 20)
     }

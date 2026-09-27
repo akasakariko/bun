@@ -14,7 +14,9 @@ use bun_sys::{self, Fd};
 use bun_uws::{AnyRequest, AnyResponse};
 
 use crate::node::types::PathOrFileDescriptor;
-use crate::server::file_response_stream::{StartOptions as FileResponseStreamOptions, StreamOwner};
+use crate::server::file_response_stream::{
+    BodyLength, StartOptions as FileResponseStreamOptions, StreamOwner, reports_no_size,
+};
 use crate::server::jsc::{JSGlobalObject, JSValue, JsResult, VirtualMachine};
 use bun_jsc::bun_string_jsc;
 
@@ -68,7 +70,7 @@ enum Serve {
         file_type: FileType,
         pollable: bool,
         offset: u64,
-        length: Option<u64>,
+        length: BodyLength,
     },
 }
 
@@ -325,6 +327,7 @@ impl FileRoute {
         resp: AnyResponse,
         method: Method,
     ) -> Serve {
+        let mut unsized_file = false;
         let (can_serve_file, offset, size, file_type, pollable) = 'brk: {
             let stat = match bun_sys::fstat(fd) {
                 Ok(s) => s,
@@ -339,6 +342,15 @@ impl FileRoute {
             let mode = stat.st_mode as bun_sys::Mode;
             if bun_sys::S::ISDIR(mode) {
                 break 'brk (false, 0, 0, FileType::File, false);
+            }
+
+            // HEAD does not read, so it keeps the answer of the `stat`.
+            let window = self.blob.size.get();
+            if reports_no_size(bun_sys::S::ISREG(mode), stat_size, window) && method != Method::HEAD
+            {
+                unsized_file = true;
+                self.stat_hash.set(StatHash::default());
+                break 'brk (true, self.blob.offset.get(), window, FileType::File, false);
             }
 
             // `Cell::take` → mutate → `set`: single-threaded event loop, no
@@ -370,6 +382,7 @@ impl FileRoute {
         // set Content-Range — they're managing partial responses themselves.
         let range: RangeRequest::Result = if (method == Method::GET || method == Method::HEAD)
             && file_type == FileType::File
+            && !unsized_file
             && self.status_code == 200
             && !self.has_content_range_header
         {
@@ -425,7 +438,9 @@ impl FileRoute {
                 return Serve::Done;
             }
             RangeRequest::Result::None => {
-                if file_type == FileType::File {
+                if unsized_file {
+                    (offset, None)
+                } else if file_type == FileType::File {
                     (offset, Some(size))
                 } else {
                     (0, None)
@@ -454,7 +469,11 @@ impl FileRoute {
             file_type,
             pollable,
             offset: body_offset,
-            length: body_len,
+            length: match body_len {
+                Some(len) => BodyLength::Exact(len),
+                None if unsized_file => BodyLength::UpTo(size),
+                None => BodyLength::ToEof,
+            },
         }
     }
 
