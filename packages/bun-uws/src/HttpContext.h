@@ -38,6 +38,7 @@
 
 extern "C" void Bun__NodeHTTP__onReadsResumable(int ssl, struct us_socket_t *s);
 extern "C" void Bun__NodeHTTP__onReadParsed(int ssl, struct us_socket_t *s);
+extern "C" void Bun__NodeHTTP__halfCloseAfterDrain(int ssl, struct us_socket_t *s);
 
 namespace uWS {
 
@@ -245,6 +246,16 @@ private:
         us_socket_close(s, LIBUS_SOCKET_CLOSE_CODE_FAST_SHUTDOWN, nullptr);
     }
 
+    /* node:http socket.end() behind queued bytes (HTTP_NODE_SHUTDOWN_AFTER_DRAIN) sends its FIN when they are out and leaves the reads as they were. */
+    template <bool IsNodeHttp>
+    static bool readsBehindDeferredFin(HttpResponseData<SSL> *httpResponseData) {
+        if constexpr (IsNodeHttp) {
+            return (httpResponseData->state & HttpResponseData<SSL>::HTTP_NODE_SHUTDOWN_AFTER_DRAIN) != 0;
+        } else {
+            return false;
+        }
+    }
+
     template <bool IsNodeHttp>
     static us_socket_t *onClose(us_socket_t *s, int code, void * /*reason*/) {
         ((AsyncSocket<SSL> *)s)->uncorkWithoutSending();
@@ -332,7 +343,7 @@ private:
         /* Do not accept any data while in shutdown state. A node:http tunnel is half-open: it still reads after socket.end(). */
         bool isHalfOpenTunnel = false;
         if constexpr (IsNodeHttp) isHalfOpenTunnel = httpResponseData->isConnectRequest;
-        if (us_socket_is_shut_down((us_socket_t *) s) && !isHalfOpenTunnel) {
+        if (us_socket_is_shut_down((us_socket_t *) s) && !isHalfOpenTunnel && !readsBehindDeferredFin<IsNodeHttp>(httpResponseData)) {
             /* Balance the us_socket_ref above — every other return path
              * reaches the unref via returnedData. */
             us_socket_unref(s);
@@ -594,7 +605,7 @@ private:
             }
 
             /* We absolutely have to terminate parsing if shutdown */
-            if (us_socket_is_shut_down((us_socket_t *) s)) {
+            if (us_socket_is_shut_down((us_socket_t *) s) && !readsBehindDeferredFin<IsNodeHttp>(httpResponseData)) {
                 return nullptr;
             }
 
@@ -686,7 +697,7 @@ private:
                 }
 
                 /* We absolutely have to terminate parsing if shutdown */
-                if (us_socket_is_shut_down((us_socket_t *) user)) {
+                if (us_socket_is_shut_down((us_socket_t *) user) && !readsBehindDeferredFin<IsNodeHttp>(httpResponseData)) {
                     return nullptr;
                 }
 
@@ -989,6 +1000,17 @@ private:
                  * not the response in flight ever ends. */
                 if (httpResponseData->state & HttpResponseData<SSL>::HTTP_NODE_CLOSE_AFTER_DRAIN) {
                     responseDone = true;
+                }
+                /* socket.end() issued while bytes were queued: Node half-closes
+                 * once they are out, whether or not the response in flight
+                 * ever ends, and keeps the socket until the peer's FIN. */
+                if (!responseDone
+                    && (httpResponseData->state & HttpResponseData<SSL>::HTTP_NODE_SHUTDOWN_AFTER_DRAIN)
+                    && httpResponseData->onWritable == nullptr
+                    && !us_socket_is_shut_down(s)
+                    && asyncSocket->hasFullyDrained()) {
+                    Bun__NodeHTTP__halfCloseAfterDrain(SSL, s);
+                    return s;
                 }
             }
             if (responseDone && asyncSocket->hasFullyDrained()) {

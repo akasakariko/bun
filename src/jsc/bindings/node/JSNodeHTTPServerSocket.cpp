@@ -358,6 +358,9 @@ static bool deferShutdownUntilResponseDrains(us_socket_t* socket, bool destroySo
     if (destroySoon) {
         /* And closes it there, even if the response never ends. */
         httpResponseData->state |= uWS::HttpResponseData<SSL>::HTTP_NODE_CLOSE_AFTER_DRAIN;
+    } else {
+        /* The FIN follows them there, and the socket stays for the peer's FIN. */
+        httpResponseData->state |= uWS::HttpResponseData<SSL>::HTTP_NODE_SHUTDOWN_AFTER_DRAIN;
     }
     return true;
 }
@@ -374,13 +377,14 @@ bool JSNodeHTTPServerSocket::shutdownAfterResponseDrains(bool destroySoon)
     return deferShutdownUntilResponseDrains<false>(socket, destroySoon);
 }
 
-JSC::EncodedJSValue JSNodeHTTPServerSocket::halfClose(JSC::JSGlobalObject* globalObject)
+JSC::EncodedJSValue JSNodeHTTPServerSocket::halfClose(JSC::JSGlobalObject* globalObject, bool keepReadPause)
 {
     // onNodeHTTPRequest no longer pauses at dispatch; pause here so the
     // shutdown+resume below still cycles kqueue's EVFILT_READ (delete then
     // re-add), without which macOS 26 does not deliver the peer's close.
     // Not for a tunnel that paused its reads: the resume that ends that pause is the re-add.
-    const bool cycleReads = !upgraded && !tunnelReadsPaused();
+    // The same goes for a pause that this FIN has to keep.
+    const bool cycleReads = !upgraded && !tunnelReadsPaused() && !(keepReadPause && socket && socket->flags.is_paused);
     if (socket && cycleReads) {
         us_socket_pause(socket);
     }
@@ -1061,6 +1065,32 @@ extern "C" void Bun__NodeHTTP__onReadParsed(int ssl, us_socket_t* socket)
     }
     if (auto* res = serverSocket->currentResponseObject.get(); res != nullptr && res->m_ctx != nullptr) {
         Bun__NodeHTTPResponse_onReadParsed(res->m_ctx);
+    }
+}
+
+template<bool SSL>
+static bool peerHasEnded(us_socket_t* socket)
+{
+    auto* httpResponseData = reinterpret_cast<uWS::HttpResponseData<SSL>*>(us_socket_ext(socket));
+    return (httpResponseData->state & uWS::HttpResponseData<SSL>::HTTP_NODE_PEER_ENDED) != 0;
+}
+
+// The bytes that a socket.end() waited for have left (HTTP_NODE_SHUTDOWN_AFTER_DRAIN). The socket can be closed when this returns.
+extern "C" void Bun__NodeHTTP__halfCloseAfterDrain(int ssl, us_socket_t* socket)
+{
+    if (us_socket_is_closed(socket)) {
+        return;
+    }
+    auto* serverSocket = ssl ? getNodeHTTPServerSocket<true>(socket) : getNodeHTTPServerSocket<false>(socket);
+    if (!serverSocket) {
+        return;
+    }
+    const bool peerEnded = ssl ? peerHasEnded<true>(socket) : peerHasEnded<false>(socket);
+    /* The connection reads behind this FIN as before it: what paused the reads (the request, queued responses) still resumes them. */
+    serverSocket->halfClose(serverSocket->globalObject(), true);
+    /* Both sides have ended: no event is left to close the socket. */
+    if (peerEnded && !serverSocket->isClosed()) {
+        serverSocket->close();
     }
 }
 
