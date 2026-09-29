@@ -240,160 +240,171 @@ mod _impl {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn cpus_impl_linux(global_this: &JSGlobalObject) -> Result<JSValue, OsError> {
-        // Create the return array
-        let values = JSValue::create_empty_array(global_this, 0)?;
-        let mut num_cpus: u32 = 0;
+    #[derive(Clone, Copy)]
+    struct LinuxCpu {
+        times: CPUTimes,
+        /// An index into the model names that `join_models` returns.
+        model: Option<u8>,
+    }
 
+    /// The CPUs that /proc/stat lists, each at the index of its id.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn parse_proc_stat(stat: &[u8]) -> Vec<Option<LinuxCpu>> {
+        // libuv ignores a CPU id that is not below this.
+        const MAX_CPUS: usize = 8192;
+        // libuv: sysconf(_SC_CLK_TCK) is fixed at 100 Hz on Linux, so a tick is 10 ms.
+        const MS_PER_TICK: u64 = 10;
+
+        let mut cpus: Vec<Option<LinuxCpu>> = Vec::with_capacity(strings::count_char(stat, b'\n'));
+        let mut lines = strings::tokenize(stat, b"\n");
+
+        // Skip the first line (aggregate of all CPUs)
+        let _ = lines.next();
+
+        for line in lines {
+            // CPU lines are formatted as `cpu0 user nice sys idle iowait irq softirq`
+            let mut toks = strings::tokenize_any(line, b" \t");
+            let Some(id) = toks
+                .next()
+                .and_then(|name| name.strip_prefix(b"cpu"))
+                .and_then(|id| parse_u32(id).ok())
+            else {
+                break; // done with CPUs
+            };
+            let mut ticks = || toks.next().and_then(|tok| parse_u64(tok).ok());
+            let (Some(user), Some(nice), Some(sys), Some(idle), Some(_iowait), Some(irq)) =
+                (ticks(), ticks(), ticks(), ticks(), ticks(), ticks())
+            else {
+                break;
+            };
+
+            let id = id as usize;
+            if id >= MAX_CPUS {
+                continue;
+            }
+            if cpus.len() <= id {
+                cpus.resize(id + 1, None);
+            }
+            cpus[id] = Some(LinuxCpu {
+                times: CPUTimes {
+                    user: user.wrapping_mul(MS_PER_TICK),
+                    nice: nice.wrapping_mul(MS_PER_TICK),
+                    sys: sys.wrapping_mul(MS_PER_TICK),
+                    idle: idle.wrapping_mul(MS_PER_TICK),
+                    irq: irq.wrapping_mul(MS_PER_TICK),
+                },
+                model: None,
+            });
+        }
+
+        cpus
+    }
+
+    /// Gives each CPU the `model name` of the /proc/cpuinfo processor that has its id.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn join_models(cpus: &mut [Option<LinuxCpu>], cpuinfo: &[u8]) -> Vec<Box<[u8]>> {
+        const KEY_PROCESSOR: &[u8] = b"processor\t: ";
+        const KEY_MODEL_NAME: &[u8] = b"model name\t: ";
+        // A CPU with a model name past this many distinct ones stays "unknown". libuv keeps 8.
+        const MAX_MODELS: usize = 32;
+
+        let mut models: Vec<Box<[u8]>> = Vec::new();
+        let mut id: Option<usize> = None;
+        for line in strings::tokenize(cpuinfo, b"\n") {
+            if let Some(digits) = line.strip_prefix(KEY_PROCESSOR) {
+                id = parse_u32(strings::trim(digits, b" \t\n"))
+                    .ok()
+                    .map(|id| id as usize);
+            } else if let Some(model) = line.strip_prefix(KEY_MODEL_NAME) {
+                let Some(id) = id else { continue };
+                let Some(Some(cpu)) = cpus.get_mut(id) else {
+                    continue;
+                };
+                // Most hosts have one model, so the last one is almost always the match.
+                let index = match models.last() {
+                    Some(last) if **last == *model => Some(models.len() - 1),
+                    _ => models.iter().position(|m| **m == *model).or_else(|| {
+                        (models.len() < MAX_MODELS).then(|| {
+                            models.push(model.into());
+                            models.len() - 1
+                        })
+                    }),
+                };
+                cpu.model = index.map(|index| index as u8);
+            }
+        }
+        models
+    }
+
+    /// `None` if the file cannot be opened or read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_optional_file<'a>(buf: &'a mut Vec<u8>, path: &ZStr) -> Option<&'a [u8]> {
+        let file = bun_sys::File::open(path, bun_sys::O::RDONLY, 0).ok()?;
+        buf.clear();
+        file.read_to_end_with_array_list(buf, bun_sys::SizeHint::ProbablySmall)
+            .ok()?;
+        Some(buf.as_slice())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn linux_cpu_to_js(
+        global_this: &JSGlobalObject,
+        times: CPUTimes,
+        model: JSValue,
+        speed: u64,
+    ) -> JSValue {
+        let cpu = JSValue::create_empty_object(global_this, 3);
+        cpu.put(global_this, b"times", times.to_value(global_this));
+        cpu.put(global_this, b"model", model);
+        cpu.put(global_this, b"speed", JSValue::js_number(speed as f64));
+        cpu
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn cpus_impl_linux(global_this: &JSGlobalObject) -> Result<JSValue, OsError> {
         let mut file_buf: Vec<u8> = Vec::new();
 
-        // Read /proc/stat to get number of CPUs and times
-        {
-            let file =
-                match bun_sys::File::open(bun_core::zstr!("/proc/stat"), bun_sys::O::RDONLY, 0) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        // hidepid mounts (common on Android) deny /proc/stat. lazyCpus in os.ts
-                        // pre-creates hostCpuCount lazy proxies, so return that many stub
-                        // entries (zeroed times / unknown model / speed 0) — matches Node.
-                        // SAFETY: pure FFI getter
-                        let count: u32 =
-                            u32::try_from(1i32.max(bun_sysconf__SC_NPROCESSORS_ONLN())).unwrap();
-                        let stubs = JSValue::create_empty_array(global_this, count as usize)?;
-                        let mut i: u32 = 0;
-                        while i < count {
-                            let cpu = JSValue::create_empty_object(global_this, 3);
-                            cpu.put(
-                                global_this,
-                                b"times",
-                                CPUTimes::default().to_value(global_this),
-                            );
-                            cpu.put(
-                                global_this,
-                                b"model",
-                                global_this.common_strings().unknown(),
-                            );
-                            cpu.put(global_this, b"speed", JSValue::js_number(0.0));
-                            stubs.put_index(global_this, i, cpu)?;
-                            i += 1;
-                        }
-                        return Ok(stubs);
-                    }
-                };
-            // file closed on Drop
-
-            file.read_to_end_with_array_list(&mut file_buf, bun_sys::SizeHint::ProbablySmall)?;
-            let contents = file_buf.as_slice();
-
-            let mut line_iter = strings::tokenize(contents, b"\n");
-
-            // Skip the first line (aggregate of all CPUs)
-            let _ = line_iter.next();
-
-            // Read each CPU line
-            while let Some(line) = line_iter.next() {
-                // CPU lines are formatted as `cpu0 user nice sys idle iowait irq softirq`
-                let mut toks = strings::tokenize_any(line, b" \t");
-                let cpu_name = toks.next();
-                if cpu_name.is_none() || !cpu_name.unwrap().starts_with(b"cpu") {
-                    break; // done with CPUs
-                }
-
-                //NOTE: libuv assumes this is fixed on Linux, not sure that's actually the case
-                let scale: u64 = 10;
-
-                let times = CPUTimes {
-                    user: scale * parse_u64(toks.next().ok_or(crate::Error::eol)?)?,
-                    nice: scale * parse_u64(toks.next().ok_or(crate::Error::eol)?)?,
-                    sys: scale * parse_u64(toks.next().ok_or(crate::Error::eol)?)?,
-                    idle: scale * parse_u64(toks.next().ok_or(crate::Error::eol)?)?,
-                    irq: {
-                        let _ = toks.next().ok_or(crate::Error::eol)?; // skip iowait
-                        scale * parse_u64(toks.next().ok_or(crate::Error::eol)?)?
-                    },
-                };
-
-                // Actually create the JS object representing the CPU
-                let cpu = JSValue::create_empty_object(global_this, 1);
-                cpu.put(global_this, b"times", times.to_value(global_this));
-                values.put_index(global_this, num_cpus, cpu)?;
-
-                num_cpus += 1;
-            }
-
-            file_buf.clear();
-        }
-
-        // Read /proc/cpuinfo to get model information (optional)
-        if let Ok(file) =
-            bun_sys::File::open(bun_core::zstr!("/proc/cpuinfo"), bun_sys::O::RDONLY, 0)
-        {
-            // file closed on Drop
-
-            file.read_to_end_with_array_list(&mut file_buf, bun_sys::SizeHint::ProbablySmall)?;
-            let contents = file_buf.as_slice();
-
-            let mut line_iter = strings::tokenize(contents, b"\n");
-
-            const KEY_PROCESSOR: &[u8] = b"processor\t: ";
-            const KEY_MODEL_NAME: &[u8] = b"model name\t: ";
-
-            let mut cpu_index: u32 = 0;
-            let mut has_model_name = true;
-            while let Some(line) = line_iter.next() {
-                if line.starts_with(KEY_PROCESSOR) {
-                    if !has_model_name {
-                        let cpu = values.get_index(global_this, cpu_index)?;
-                        cpu.put(
-                            global_this,
-                            b"model",
-                            global_this.common_strings().unknown(),
-                        );
-                    }
-                    // If this line starts a new processor, parse the index from the line
-                    let digits = strings::trim(&line[KEY_PROCESSOR.len()..], b" \t\n");
-                    cpu_index = parse_u32(digits)?;
-                    if cpu_index >= num_cpus {
-                        return Err(OsError::Any);
-                    }
-                    has_model_name = false;
-                } else if line.starts_with(KEY_MODEL_NAME) {
-                    // If this is the model name, extract it and store on the current cpu
-                    let model_name = &line[KEY_MODEL_NAME.len()..];
-                    let cpu = values.get_index(global_this, cpu_index)?;
-                    cpu.put(
+        let file = match bun_sys::File::open(bun_core::zstr!("/proc/stat"), bun_sys::O::RDONLY, 0) {
+            Ok(f) => f,
+            Err(_) => {
+                // hidepid mounts (common on Android) deny /proc/stat. lazyCpus in os.ts
+                // pre-creates hostCpuCount lazy proxies, so return that many stub
+                // entries (zeroed times / unknown model / speed 0) — matches Node.
+                // SAFETY: pure FFI getter
+                let count: u32 =
+                    u32::try_from(1i32.max(bun_sysconf__SC_NPROCESSORS_ONLN())).unwrap();
+                let stubs = JSValue::create_empty_array(global_this, count as usize)?;
+                let mut i: u32 = 0;
+                while i < count {
+                    let cpu = linux_cpu_to_js(
                         global_this,
-                        b"model",
-                        bun_string_jsc::create_utf8_for_js(global_this, model_name)?,
+                        CPUTimes::default(),
+                        global_this.common_strings().unknown(),
+                        0,
                     );
-                    has_model_name = true;
+                    stubs.put_index(global_this, i, cpu)?;
+                    i += 1;
                 }
+                return Ok(stubs);
             }
-            if !has_model_name {
-                let cpu = values.get_index(global_this, cpu_index)?;
-                cpu.put(
-                    global_this,
-                    b"model",
-                    global_this.common_strings().unknown(),
-                );
-            }
+        };
+        file.read_to_end_with_array_list(&mut file_buf, bun_sys::SizeHint::ProbablySmall)?;
 
-            file_buf.clear();
-        } else {
-            // Initialize model name to "unknown"
-            let mut it = values.array_iterator(global_this)?;
-            while let Some(cpu) = it.next()? {
-                cpu.put(
-                    global_this,
-                    b"model",
-                    global_this.common_strings().unknown(),
-                );
-            }
+        let mut cpus = parse_proc_stat(&file_buf);
+        let models = read_optional_file(&mut file_buf, bun_core::zstr!("/proc/cpuinfo"))
+            .map(|cpuinfo| join_models(&mut cpus, cpuinfo))
+            .unwrap_or_default();
+
+        let count = cpus.iter().flatten().count();
+        if count == 0 {
+            return Err(OsError::Any);
         }
 
-        // Read /sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq to get current frequency (optional)
-        for cpu_index in 0..num_cpus as usize {
-            let cpu = values.get_index(global_this, cpu_index as u32)?;
+        let values = JSValue::create_empty_array(global_this, count)?;
+        let mut index: u32 = 0;
+        let mut last_model: Option<(u8, JSValue)> = None;
+        for (id, cpu) in cpus.iter().enumerate() {
+            let Some(cpu) = cpu else { continue };
 
             let mut path_buf = [0u8; 128];
             let path: &ZStr = {
@@ -401,7 +412,7 @@ mod _impl {
                 write!(
                     cursor,
                     "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq\0",
-                    cpu_index
+                    id
                 )
                 .map_err(|_| crate::Error::fmt)?;
                 let remaining = cursor.len();
@@ -409,22 +420,29 @@ mod _impl {
                 // SAFETY: we wrote a NUL terminator at path_buf[written-1]
                 ZStr::from_buf(&path_buf[..], written - 1)
             };
-            if let Ok(file) = bun_sys::File::open(path, bun_sys::O::RDONLY, 0) {
-                // file closed on Drop
+            let speed = read_optional_file(&mut file_buf, path)
+                .and_then(|khz| parse_u64(strings::trim(khz, b" \n")).ok())
+                .map_or(0, |khz| khz / 1000);
 
-                file.read_to_end_with_array_list(&mut file_buf, bun_sys::SizeHint::ProbablySmall)?;
-                let contents = file_buf.as_slice();
-
-                let digits = strings::trim(contents, b" \n");
-                let speed = parse_u64(digits).unwrap_or(0) / 1000;
-
-                cpu.put(global_this, b"speed", JSValue::js_number(speed as f64));
-
-                file_buf.clear();
-            } else {
-                // Initialize CPU speed to 0
-                cpu.put(global_this, b"speed", JSValue::js_number(0.0));
-            }
+            // CPUs with the same model name share one JS string.
+            let model = match (cpu.model, last_model) {
+                (None, _) => global_this.common_strings().unknown(),
+                (Some(model), Some((last, value))) if model == last => value,
+                (Some(model), _) => {
+                    let value = bun_string_jsc::create_utf8_for_js(
+                        global_this,
+                        &models[usize::from(model)],
+                    )?;
+                    last_model = Some((model, value));
+                    value
+                }
+            };
+            values.put_index(
+                global_this,
+                index,
+                linux_cpu_to_js(global_this, cpu.times, model, speed),
+            )?;
+            index += 1;
         }
 
         Ok(values)

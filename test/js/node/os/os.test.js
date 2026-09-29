@@ -200,6 +200,7 @@ describe.skipIf(!isLinux || !cc)("cpus on staged /proc and /sys files", () => {
     speed,
     times: { user, nice: 0, sys: 100, idle: 1000, irq: 0 },
   });
+  const range = (from, to) => Array.from({ length: to - from }, (_, i) => from + i);
 
   async function cpusOn(layouts) {
     using root = tempDir("os-cpus", layouts);
@@ -235,6 +236,81 @@ describe.skipIf(!isLinux || !cc)("cpus on staged /proc and /sys files", () => {
       four: [cpu(0), cpu(1), cpu(2), cpu(3)],
       bare: [cpu(0, { model: "unknown", speed: 0 }), cpu(1, { model: "unknown", speed: 0 })],
     });
+  });
+
+  // https://github.com/oven-sh/bun/issues/29689
+  it.concurrent("keeps each CPU with its own id when the ids have a gap", async () => {
+    const epyc = [...range(0, 64), ...range(128, 192)];
+    const seen = await cpusOn({
+      epyc: layout({ stat: epyc }),
+      pairs: layout({ stat: [0, 1, 4, 5] }),
+    });
+    expect(seen).toEqual({
+      epyc: epyc.map(id => cpu(id)),
+      pairs: [cpu(0), cpu(1), cpu(4), cpu(5)],
+    });
+  });
+
+  it.concurrent("takes the CPU list from /proc/stat as libuv does", async () => {
+    const seen = await cpusOn({
+      // The last line for an id wins.
+      repeated: layout({
+        stat: [0, 1],
+        "proc/stat": statFile([statLine(0), statLine(1), "cpu0 9 0 10 100 0 0 0 0 0 0"]),
+      }),
+      // The result is in id order.
+      unordered: layout({ stat: [2, 0, 1] }),
+      // The list ends at the first line that does not have the six numbers.
+      shortLine: layout({ stat: [0, 1, 2], "proc/stat": statFile([statLine(0), "cpu1 2 0 10", statLine(2)]) }),
+      // An id of 8192 or more is not a CPU.
+      bigId: layout({ stat: [0, 8192] }),
+      // The tick counts wrap at 64 bits.
+      hugeTicks: layout({ stat: [0], "proc/stat": statFile(["cpu0 18446744073709551615 0 10 100 0 0 0 0 0 0"]) }),
+    });
+    expect(seen).toEqual({
+      repeated: [cpu(0, { user: 90 }), cpu(1)],
+      unordered: [cpu(0), cpu(1), cpu(2)],
+      shortLine: [cpu(0)],
+      bigId: [cpu(0)],
+      hugeTicks: [cpu(0, { user: 18446744073709551606 })],
+    });
+  });
+
+  it.concurrent("joins /proc/cpuinfo and cpufreq by id and skips what it cannot use", async () => {
+    const seen = await cpusOn({
+      // https://github.com/oven-sh/bun/issues/44125
+      extraProcessor: layout({ stat: range(0, 8), cpuinfo: range(0, 9) }),
+      missingProcessor: layout({ stat: [0, 4], cpuinfo: [4], cpufreq: [4] }),
+      badProcessor: layout({
+        stat: [0, 1],
+        "proc/cpuinfo": "processor\t: 0\nmodel name\t: A\n\nprocessor\t: x\nmodel name\t: B\n\n",
+      }),
+      // A directory opens for reading, and then read() fails with EISDIR.
+      unreadable: layout({
+        stat: [0, 1],
+        "proc/cpuinfo": {},
+        "sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq": {},
+      }),
+      // Only the first 32 distinct model names are kept.
+      manyModels: layout({
+        stat: range(0, 34),
+        "proc/cpuinfo": range(0, 34)
+          .map(id => `processor\t: ${id}\nmodel name\t: Model ${id}\n\n`)
+          .join(""),
+      }),
+    });
+    expect(seen).toEqual({
+      extraProcessor: range(0, 8).map(id => cpu(id)),
+      missingProcessor: [cpu(0, { model: "unknown", speed: 0 }), cpu(4)],
+      badProcessor: [cpu(0, { model: "A" }), cpu(1, { model: "unknown" })],
+      unreadable: [cpu(0, { model: "unknown", speed: 0 }), cpu(1, { model: "unknown" })],
+      manyModels: range(0, 34).map(id => cpu(id, { model: id < 32 ? `Model ${id}` : "unknown" })),
+    });
+  });
+
+  it.concurrent("throws when /proc/stat lists no CPU", async () => {
+    const seen = await cpusOn({ none: layout({ stat: [] }) });
+    expect(seen).toEqual({ none: { error: "ERR_SYSTEM_ERROR", message: "Failed to get CPU information" } });
   });
 });
 
