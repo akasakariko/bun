@@ -472,6 +472,8 @@ static constexpr uint32_t kAutoHeaderKeepAliveTimeout = 1 << 3;
 // Node's _storeHeader emits chunked Transfer-Encoding after Connection/Keep-Alive, so it
 // cannot ride in the flat array (written first). Carry as an auto-header bit, rendered last.
 static constexpr uint32_t kAutoHeaderTransferEncodingChunked = 1 << 4;
+// No header line: the connection stays open after this response. Read for a response to an HTTP/1.0 request.
+static constexpr uint32_t kAutoHeaderPersist = 1 << 5;
 
 // "Date: <IMF-fixdate>\r\n", rebuilt at most once per second. Hand-rolled
 // (not strftime) so the day/month names are locale-independent.
@@ -536,6 +538,15 @@ static void writeAutoHeaders(uWS::HttpResponse<isSSL>* response, uint32_t autoHe
         // Same state the flat-array path sets when it sees the header, so uWS
         // chunk-frames the body.
         response->getHttpResponseData()->state |= uWS::HttpResponseData<isSSL>::HTTP_WROTE_TRANSFER_ENCODING_HEADER;
+    }
+    // HTTP_ANCIENT_REQUEST closes the connection after the response. The writer sends no chunks to such a
+    // request, so the connection stays open only behind a response that has a Content-Length or no body.
+    auto* data = response->getHttpResponseData();
+    if (data->state & uWS::HttpResponseData<isSSL>::HTTP_ANCIENT_REQUEST) [[unlikely]] {
+        if ((autoHeaderBits & kAutoHeaderPersist)
+            && (data->state & (uWS::HttpResponseData<isSSL>::HTTP_WROTE_CONTENT_LENGTH_HEADER | uWS::HttpResponseData<isSSL>::HTTP_NO_BODY_STATUS))) {
+            data->state &= ~uWS::HttpResponseData<isSSL>::HTTP_ANCIENT_REQUEST;
+        }
     }
 }
 

@@ -872,15 +872,25 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
         const uniqueHeaders = server[kUniqueHeaders];
         if (uniqueHeaders != null) http_res[kUniqueHeaders] = uniqueHeaders;
 
-        // The request itself forbids connection reuse (HTTP/1.0, or the
-        // client sent Connection: close): end the server's writable side as
-        // soon as the response has been written, like Node.js's resOnFinish.
-        // Registered before the 'request' event so the socket is already
-        // ended inside user 'finish' listeners. (Not done for the
-        // maxRequestsPerSocket limit - pipelined requests past the limit
-        // still need to be answered with 503.)
+        // Node's parserOnIncoming assigns the parser's verdict: res.shouldKeepAlive = keepAlive.
+        // The builtin constructor already holds that value for HTTP/1.1 keep-alive.
         if (!http_req[kReqShouldKeepAlive]) {
+          http_res.shouldKeepAlive = false;
+          // The request itself forbids connection reuse (HTTP/1.0 without
+          // keep-alive, or the client sent Connection: close): end the server's
+          // writable side as soon as the response has been written, like
+          // Node.js's resOnFinish. Registered before the 'request' event so the
+          // socket is already ended inside user 'finish' listeners. (Not done
+          // for the maxRequestsPerSocket limit - pipelined requests past the
+          // limit still need to be answered with 503.)
           http_res[kMustCloseConnection] = true;
+        } else if (isAncientHTTP) {
+          http_res.shouldKeepAlive = true;
+          http_res[kNoChunkedFraming] = true;
+          // Node prints `max` in Keep-Alive for every version and counts HTTP/1.1 requests only.
+          http_res._maxRequestsPerSocket = server.maxRequestsPerSocket;
+        } else if (ResponseClass !== ServerResponse) {
+          http_res.shouldKeepAlive = true;
         }
         // One plain on() listener (once() allocates a wrapper, a second listener
         // deoptimizes every 'finish' emit), registered before the 'request' event
@@ -2384,6 +2394,10 @@ const AUTO_HEADER_KEEP_ALIVE_TIMEOUT = 1 << 3;
 // line, so it is rendered natively with the other auto headers rather than being
 // pushed into the flat array (which goes out first).
 const AUTO_HEADER_TRANSFER_ENCODING_CHUNKED = 1 << 4;
+// No header line: the connection stays open after this response. The native
+// writeHead reads it for a response to an HTTP/1.0 request, which closes the
+// connection without it.
+const AUTO_HEADER_PERSIST = 1 << 5;
 // The largest Keep-Alive timeout, in seconds, handed to the native writeHead (it takes a uint32).
 const kMaxNativeKeepAliveSecs = 0x7fffffff;
 // Out-parameters of renderNativeHeaders, read by its callers in the same
@@ -2458,15 +2472,18 @@ function renderNativeHeaders(res) {
     // chunked Transfer-Encoding on such a response could confuse reverse
     // proxies, so like Node.js the body framing is suppressed and the
     // connection is forcibly closed after the response.
+    // The native writer sends the body of a response to an HTTP/1.0 request as
+    // it is, whatever the Transfer-Encoding says, so that connection closes too.
+    // Node.js frames that body by the value of the header and keeps it open.
     // headersMap already holds res[kOutHeaders]; index the two framing headers
     // once instead of re-reading the symbol per check below.
     const storedTransferEncoding = headersMap === null ? undefined : headersMap["transfer-encoding"];
     const storedContentLength = headersMap === null ? undefined : headersMap["content-length"];
-    let defectiveNoBodyResponse = false;
+    let closesForFraming = false;
     if (storedTransferEncoding !== undefined) {
       const statusCode = res[kSnapshotStatusCode] ?? res.statusCode;
-      if (statusCode === 204 || statusCode === 304) {
-        defectiveNoBodyResponse = true;
+      if (statusCode === 204 || statusCode === 304 || res[kNoChunkedFraming]) {
+        closesForFraming = true;
         res[kMustCloseConnection] = true;
       }
     }
@@ -2503,6 +2520,10 @@ function renderNativeHeaders(res) {
           closeDelimited = true;
           res[kMustCloseConnection] = true;
         }
+      } else if (res[kNoChunkedFraming]) {
+        // Node's _storeHeader sends chunks here, or the Content-Length of end(data), and keeps the connection open.
+        closesForFraming = true;
+        res[kMustCloseConnection] = true;
       }
     }
 
@@ -2512,10 +2533,16 @@ function renderNativeHeaders(res) {
       // still closes after 'finish' when shouldKeepAlive was cleared.
       if (res.shouldKeepAlive === false) {
         res[kMustCloseConnection] = true;
+      } else if (res[kMustCloseConnection] !== true) {
+        autoHeaders |= AUTO_HEADER_PERSIST;
       }
-    } else if (!hasConnection) {
+    } else if (hasConnection) {
+      if (res[kMustCloseConnection] !== true) {
+        autoHeaders |= AUTO_HEADER_PERSIST;
+      }
+    } else {
       if (
-        !defectiveNoBodyResponse &&
+        !closesForFraming &&
         !closeDelimited &&
         canPersist &&
         !res.maxRequestsOnConnectionReached &&
@@ -2528,10 +2555,11 @@ function renderNativeHeaders(res) {
           const timeoutSecs = MathFloor(keepAliveTimeout / 1000);
           const hasMax = ~~maxRequestsPerSocket > 0;
           if (!hasMax && timeoutSecs >= 0 && timeoutSecs <= kMaxNativeKeepAliveSecs) {
-            autoHeaders |= AUTO_HEADER_CONN_KEEP_ALIVE | AUTO_HEADER_KEEP_ALIVE_TIMEOUT;
+            autoHeaders |= AUTO_HEADER_CONN_KEEP_ALIVE | AUTO_HEADER_KEEP_ALIVE_TIMEOUT | AUTO_HEADER_PERSIST;
             keepAliveSecs = timeoutSecs;
           } else {
             // Rare path (maxRequestsPerSocket set, or seconds the native side cannot take): render both lines in JS, as Node prints them.
+            autoHeaders |= AUTO_HEADER_PERSIST;
             flat.push("Connection", "keep-alive");
             flat.push(
               "Keep-Alive",
@@ -2539,7 +2567,7 @@ function renderNativeHeaders(res) {
             );
           }
         } else {
-          autoHeaders |= AUTO_HEADER_CONN_KEEP_ALIVE;
+          autoHeaders |= AUTO_HEADER_CONN_KEEP_ALIVE | AUTO_HEADER_PERSIST;
         }
       } else {
         // Like Node's shouldSendKeepAlive/_last handling: a user-cleared
@@ -2586,6 +2614,9 @@ function renderNativeHeaders(res) {
 }
 
 const kMustCloseConnection = Symbol("kMustCloseConnection");
+// The native dispatcher sets it on the response to an HTTP/1.0 request that asks for keep-alive. The native
+// writer sends no chunks to such a request: behind a body, only a Content-Length keeps the connection open.
+const kNoChunkedFraming = Symbol("kNoChunkedFraming");
 function stopServerResponsePerf(this: any) {
   if (this[kServerResponseStatistics] && hasObserver("http")) {
     stopPerf(this, kServerResponseStatistics, {
@@ -3097,24 +3128,24 @@ const DISPATCH_EXPECT_CONTINUE = 1 << 5;
 const DISPATCH_HAS_CONTENT_LENGTH = 1 << 6;
 const DISPATCH_HAS_TRANSFER_ENCODING = 1 << 7;
 
-// Whether the response should advertise a persistent connection.
+// Whether the response should advertise a persistent connection, for a request
+// that the native dispatcher did not stamp: one on a connection from
+// emit('connection') or http2 allowHTTP1.
 // `connection` is the request's Connection header value (or undefined).
 function shouldKeepAliveForConnection(req, connection) {
   if (!req) return true;
   if (req.httpVersionMajor === 1 && req.httpVersionMinor === 0) {
-    // The native server always closes HTTP/1.0 connections after the
-    // response, even when the request asked for keep-alive, so the response
-    // must advertise Connection: close to stay consistent with the transport.
-    // (Node.js answers Connection: close here too whenever it cannot frame
-    // the response without closing, which is the common case for HTTP/1.0.)
+    // Node.js keeps the connection open for an HTTP/1.0 request with keep-alive.
+    // Such a connection has no keep-alive timer here: it would stay open for good.
     return false;
   }
   return !(typeof connection === "string" && RE_CONN_CLOSE.test(connection));
 }
 
-// Result of shouldKeepAliveForConnection, computed once at dispatch and
-// reused by renderNativeHeaders / the pipelined-response path so neither has
-// to re-read req.headers (which would materialize the lazy header object).
+// The keep-alive verdict on the request: the native parser's, stamped at
+// dispatch, or the result of shouldKeepAliveForConnection. renderNativeHeaders
+// and the pipelined-response path read it here and not from req.headers (which
+// would materialize the lazy header object).
 
 function requestShouldKeepAlive(req) {
   if (!req) return true;
@@ -3261,6 +3292,8 @@ ServerResponse.prototype.setTimeout = function setTimeout(msecs, callback) {
 ServerResponse.prototype._removedConnection = false;
 
 ServerResponse.prototype._removedContLen = false;
+
+ServerResponse.prototype[kNoChunkedFraming] = false;
 
 ServerResponse.prototype._hasBody = true;
 

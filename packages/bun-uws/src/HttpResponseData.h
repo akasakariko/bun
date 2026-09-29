@@ -100,8 +100,9 @@ struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
         HTTP_WROTE_DATE_HEADER = 64, // used
         HTTP_WROTE_TRANSFER_ENCODING_HEADER = 128, // used
 
-        /* The request was HTTP/1.0 or older: no keep-alive and no chunked
-         * framing, so a body without Content-Length is delimited by close. */
+        /* The request was HTTP/1.0 or older: no chunked framing, and the connection
+         * closes after the response. node:http clears the bit in the head of a
+         * response that keeps the connection open (NodeHTTPServer__writeHead). */
         HTTP_ANCIENT_REQUEST = 1 << 8,
         /* The response carries no body framing at all: no Content-Length, no
          * chunked encoding, no terminating chunk. writeStatus() sets it for 1xx
@@ -251,7 +252,7 @@ struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
     /* Whether the connection should be torn down once the in-flight response (if
      * any) has completed and all buffered outgoing data has been flushed. */
     bool shouldCloseConnection() const {
-        return (state & (HTTP_CONNECTION_CLOSE | HTTP_NODE_CLOSE_AFTER_DRAIN))
+        return (state & (HTTP_CONNECTION_CLOSE | HTTP_ANCIENT_REQUEST | HTTP_NODE_CLOSE_AFTER_DRAIN))
             || ((state & HTTP_NODE_RECEIVED_FIN) && nodeHttpQueuedPipelinedCount == 0)
             || ((state & HTTP_CLOSE_WHEN_IDLE) && this->isIdle);
     }
@@ -260,9 +261,12 @@ struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
      * close-delimited body) is complete; the socket only stays open until its
      * buffered bytes drain. Nothing received from here on is a request this
      * connection may answer (RFC 9112 9.6), and after a close-delimited body the
-     * peer would read whatever we send as more body. */
+     * peer would read whatever we send as more body.
+     * Bun.serve sets HTTP_ANCIENT_REQUEST only together with HTTP_CONNECTION_CLOSE. */
+    template <bool ForNodeHttp>
     bool isDrainingBeforeClose() const {
-        return (state & (HTTP_CONNECTION_CLOSE | HTTP_RESPONSE_PENDING)) == HTTP_CONNECTION_CLOSE;
+        constexpr uint32_t closes = ForNodeHttp ? HTTP_CONNECTION_CLOSE | HTTP_ANCIENT_REQUEST : HTTP_CONNECTION_CLOSE;
+        return (state & closes) && !(state & HTTP_RESPONSE_PENDING);
     }
 };
 
