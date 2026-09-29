@@ -1201,4 +1201,46 @@ describe("many routes", () => {
     expect((await fetch(`${base}/other0`)).status).toBe(404);
     expect(await fetch(`${base}/leaf500`).then(r => r.text())).toBe("500");
   });
+
+  test("a route handler can reload() the table it was matched in", async () => {
+    const n = 300;
+    let generation = 0;
+    function table(g: number) {
+      const routes: Record<string, (req: BunRequest) => Response> = {};
+      for (let i = 0; i < n; i++) {
+        routes[`/g${g}/leaf${i}`] = () => new Response(`g${g}:${i}`);
+      }
+      routes["/swap"] = () => {
+        generation++;
+        server.reload({ routes: table(generation) });
+        return new Response(`swapped to ${generation}`);
+      };
+      routes["/:any"] = req => new Response(`param:${req.params.any}`);
+      return routes;
+    }
+    using server = Bun.serve({ port: 0, routes: table(0) });
+    const base = `http://127.0.0.1:${server.port}`;
+
+    const seen: string[] = [];
+    for (let round = 0; round < 3; round++) {
+      seen.push(await fetch(`${base}/g${generation}/leaf${n - 1}`).then(r => r.text()));
+      seen.push(await fetch(`${base}/swap`).then(r => r.text()));
+      seen.push(String((await fetch(`${base}/g${generation - 1}/leaf0`)).status));
+      seen.push(await fetch(`${base}/other`).then(r => r.text()));
+    }
+    expect(seen).toEqual([
+      "g0:299",
+      "swapped to 1",
+      "404",
+      "param:other",
+      "g1:299",
+      "swapped to 2",
+      "404",
+      "param:other",
+      "g2:299",
+      "swapped to 3",
+      "404",
+      "param:other",
+    ]);
+  });
 });
