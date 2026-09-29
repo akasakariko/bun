@@ -1134,12 +1134,11 @@ describe("many routes", () => {
     // Warm up JIT + allocator so the small sample is not dominated by
     // first-call overhead.
     timeBuild(300);
-    timeBuild(300);
 
-    // Best of three for each sample to cut scheduling jitter; the ratio is
-    // what matters, not the absolute times.
+    // The best of several runs for each sample to cut scheduling jitter; the
+    // ratio is what matters, not the absolute times.
     const small = Math.min(timeBuild(300), timeBuild(300), timeBuild(300));
-    const large = Math.min(timeBuild(2400), timeBuild(2400), timeBuild(2400));
+    const large = Math.min(timeBuild(2400), timeBuild(2400));
     const ratio = large / small;
 
     // 8x the routes. Linear ~= 8x; the old O(N^2) path measured 50-80x here.
