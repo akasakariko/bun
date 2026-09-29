@@ -18,6 +18,7 @@
 #ifndef UWS_HTTPROUTER_HPP
 #define UWS_HTTPROUTER_HPP
 
+#include <cstdint>
 #include <map>
 #include <vector>
 #include <cstring>
@@ -52,48 +53,416 @@ private:
     std::string_view urlSegmentVector[MAX_URL_SEGMENTS] = {};
     int urlSegmentTop = -1;
 
-    /* The matching tree */
+    static constexpr uint32_t NONE = UINT32_MAX;
+    static constexpr uint32_t ROOT = 0;
+    static constexpr uint32_t CHILD_LIST_HEADER = 4;
+    /* A run of static children this short is scanned by name, as hashing the
+     * segment costs more than the few compares */
+    static constexpr uint32_t SCANNED_RUN = 4;
+
+    /* The matching tree, stored flat. Nodes name their parent by index and
+     * nothing points at a node, so `nodes` can grow and be compacted freely.
+     *
+     * add() appends nodes and finds an existing child through `lookup`, a hash
+     * index over (parent, priority tier, name), so registration is O(1) per
+     * segment. sortChildren() then lays every child list out in `edges` and
+     * frees `lookup`; route() binary-searches the sorted lists. */
     struct Node {
-        std::string name = {};
-        std::vector<std::unique_ptr<Node>> children = {};
-        std::vector<uint32_t> handlers = {};
-        bool isHighPriority = false;
+        /* The name is names[nameOffset, nameOffset + nameLength). One add()
+         * stores a segment once and the node of every method shares it. */
+        uint32_t nameOffset;
+        uint32_t nameLength;
+        uint32_t parent;
+        /* Head of this node's handlers in handlerLinks, ordered by priority */
+        uint32_t firstHandler;
+        /* Offset of this node's child list in edges, NONE for a leaf */
+        uint32_t childList;
+        bool isHighPriority;
+        bool dead;
+    };
 
-        explicit constexpr Node(std::string name) noexcept : name(std::move(name)) {}
-    } root {"rootNode"};
+    struct HandlerLink {
+        uint32_t handler;
+        uint32_t next;
+    };
 
-    /* Sort wildcards after alphanum */
-    int lexicalOrder(std::string_view name) {
-        if (name.empty()) {
-            return 2;
-        }
-        if (name[0] == ':') {
-            return 1;
-        }
-        if (name[0] == '*') {
-            return 0;
-        }
-        return 2;
+    std::vector<Node> nodes;
+    std::vector<char> names;
+    std::vector<HandlerLink> handlerLinks;
+    uint32_t freeHandlerLink = NONE;
+    uint32_t deadNodes = 0;
+
+    /* One list per node that has children: four counts (high static, high
+     * special, normal static, normal special), then the children in that
+     * order. This is the order the children are tried in: high priority
+     * before normal, and within a priority a static name, then ':', then '*'.
+     * A run of static children is its name hashes, sorted, followed by the
+     * children in the same order, so a search stays inside one run of
+     * integers and reads a node only to confirm the match. */
+    std::vector<uint32_t> edges;
+    bool sorted = false;
+
+    /* Open addressing over node indices. Empty means not built. */
+    std::vector<uint32_t> lookup;
+    uint32_t lookupCount = 0;
+
+    /* True when edges is current and lookup is freed */
+    bool ready = false;
+
+    /* Most requests are GET, and ANY is tried for every request that no
+     * method route took, so route() does not search for either */
+    uint32_t getMethod = NONE;
+    uint32_t anyMethod = NONE;
+
+    std::string_view nameOf(const Node &node) const {
+        return {names.data() + node.nameOffset, node.nameLength};
     }
 
-    /* Advance from parent to child, adding child if necessary */
-    Node *getNode(Node *parent, std::string_view child, bool isHighPriority) {
-        for (const std::unique_ptr<Node> &node : parent->children) {
-            if (node->name == child && node->isHighPriority == isHighPriority) {
-                return node.get();
+    /* A ':' or '*' segment matches by rule, every other name (the empty
+     * segment of "//" too) matches itself. Methods always match themselves. */
+    static bool isSpecialName(std::string_view name) {
+        return !name.empty() && (name[0] == ':' || name[0] == '*');
+    }
+
+    static uint64_t hashWord(uint64_t hash, uint64_t word) {
+        hash = (hash ^ word) * 0xff51afd7ed558ccdull;
+        return hash ^ (hash >> 32);
+    }
+
+    static uint64_t hashBytes(std::string_view name) {
+        const char *data = name.data();
+        size_t size = name.size();
+        uint64_t hash = size * 0x9e3779b97f4a7c15ull;
+        if (size >= 8) {
+            /* Whole words, then the last eight bytes, which can overlap */
+            uint64_t word;
+            for (; size > 8; data += 8, size -= 8) {
+                memcpy(&word, data, 8);
+                hash = hashWord(hash, word);
+            }
+            memcpy(&word, data + size - 8, 8);
+            return hashWord(hash, word);
+        }
+        if (size >= 4) {
+            uint32_t head, tail;
+            memcpy(&head, data, 4);
+            memcpy(&tail, data + size - 4, 4);
+            return hashWord(hash, ((uint64_t) head << 32) | tail);
+        }
+        if (size) {
+            uint64_t word = ((uint64_t) (unsigned char) data[0] << 16) | ((uint64_t) (unsigned char) data[size / 2] << 8) | (unsigned char) data[size - 1];
+            return hashWord(hash, word);
+        }
+        return hash;
+    }
+
+    static uint32_t hashName(std::string_view name) {
+        return (uint32_t) hashBytes(name);
+    }
+
+    static uint64_t hashKey(uint32_t parent, bool isHighPriority, std::string_view name) {
+        uint64_t hash = hashBytes(name);
+        hash ^= (((uint64_t) parent << 1) | (uint64_t) isHighPriority) * 0x9e3779b97f4a7c15ull;
+        hash ^= hash >> 29;
+        hash *= 0xbf58476d1ce4e5b9ull;
+        hash ^= hash >> 32;
+        return hash;
+    }
+
+    uint32_t lookupFind(uint32_t parent, std::string_view name, bool isHighPriority) const {
+        size_t mask = lookup.size() - 1;
+        for (size_t i = hashKey(parent, isHighPriority, name) & mask;; i = (i + 1) & mask) {
+            uint32_t candidate = lookup[i];
+            if (candidate == NONE) {
+                return NONE;
+            }
+            const Node &node = nodes[candidate];
+            if (node.parent == parent && node.isHighPriority == isHighPriority && nameOf(node) == name) {
+                return candidate;
             }
         }
+    }
 
-        /* Insert sorted, but keep order if parent is root (we sort methods by priority elsewhere) */
-        auto newNode = std::make_unique<Node>(std::string(child));
-        newNode->isHighPriority = isHighPriority;
-        auto iter = std::upper_bound(parent->children.begin(), parent->children.end(), newNode, [parent, this](auto &a, auto &b) {
-            if (a->isHighPriority != b->isHighPriority) {
-                return a->isHighPriority;
+    void lookupInsert(uint32_t index) {
+        const Node &node = nodes[index];
+        size_t mask = lookup.size() - 1;
+        size_t i = hashKey(node.parent, node.isHighPriority, nameOf(node)) & mask;
+        while (lookup[i] != NONE) {
+            i = (i + 1) & mask;
+        }
+        lookup[i] = index;
+        lookupCount++;
+    }
+
+    void rebuildLookup(size_t capacity) {
+        lookup.assign(capacity, NONE);
+        lookupCount = 0;
+        for (uint32_t i = 1; i < nodes.size(); i++) {
+            if (!nodes[i].dead) {
+                lookupInsert(i);
             }
-            return !b->name.empty() && (parent != &root) && (lexicalOrder(b->name) < lexicalOrder(a->name));
-        });
-        return parent->children.emplace(iter, std::move(newNode))->get();
+        }
+    }
+
+    void ensureLookup() {
+        if (!lookup.empty()) {
+            return;
+        }
+        size_t capacity = 16;
+        while (capacity * 3 < (nodes.size() - deadNodes) * 4) {
+            capacity *= 2;
+        }
+        rebuildLookup(capacity);
+        ready = false;
+    }
+
+    /* Searches one run of static children */
+    uint32_t findStatic(uint32_t first, uint32_t count, std::string_view name) const {
+        const uint32_t *hashes = edges.data() + first;
+        const uint32_t *children = hashes + count;
+        if (count <= SCANNED_RUN) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (nameOf(nodes[children[i]]) == name) {
+                    return children[i];
+                }
+            }
+            return NONE;
+        }
+        uint32_t hash = hashName(name);
+        uint32_t low = 0;
+        for (uint32_t size = count; size;) {
+            uint32_t half = size / 2;
+            if (hashes[low + half] < hash) {
+                low += half + 1;
+                size -= half + 1;
+            } else {
+                size = half;
+            }
+        }
+        for (; low < count && hashes[low] == hash; low++) {
+            if (nameOf(nodes[children[low]]) == name) {
+                return children[low];
+            }
+        }
+        return NONE;
+    }
+
+    uint32_t sortedFind(uint32_t parent, std::string_view name, bool isHighPriority) const {
+        uint32_t list = nodes[parent].childList;
+        if (list == NONE) {
+            return NONE;
+        }
+        uint32_t first = list + CHILD_LIST_HEADER;
+        if (!isHighPriority) {
+            first += edges[list] * 2 + edges[list + 1];
+        }
+        uint32_t statics = edges[list + (isHighPriority ? 0 : 2)];
+        uint32_t specials = edges[list + (isHighPriority ? 1 : 3)];
+        if (parent == ROOT || !isSpecialName(name)) {
+            return findStatic(first, statics, name);
+        }
+        for (uint32_t i = first + statics * 2; i < first + statics * 2 + specials; i++) {
+            if (nameOf(nodes[edges[i]]) == name) {
+                return edges[i];
+            }
+        }
+        return NONE;
+    }
+
+    /* Finds an existing child by exact name */
+    uint32_t findChild(uint32_t parent, std::string_view name, bool isHighPriority) {
+        if (lookup.empty() && sorted) {
+            return sortedFind(parent, name, isHighPriority);
+        }
+        ensureLookup();
+        return lookupFind(parent, name, isHighPriority);
+    }
+
+    /* Advance from parent to child, adding child if necessary. stored is where
+     * this add() already put the name, or NONE. */
+    uint32_t getNode(uint32_t parent, std::string_view child, bool isHighPriority, uint32_t &stored) {
+        ensureLookup();
+        uint32_t existing = lookupFind(parent, child, isHighPriority);
+        if (existing != NONE) {
+            return existing;
+        }
+        if (((size_t) lookupCount + 1) * 4 > lookup.size() * 3) {
+            rebuildLookup(lookup.size() * 2);
+        }
+        if (stored == NONE) {
+            stored = (uint32_t) names.size();
+            names.insert(names.end(), child.begin(), child.end());
+        }
+        uint32_t index = (uint32_t) nodes.size();
+        nodes.push_back({stored, (uint32_t) child.size(), parent, NONE, NONE, isHighPriority, false});
+        lookupInsert(index);
+        sorted = false;
+        return index;
+    }
+
+    /* Drops dead nodes. A child always has a higher index than its parent and a
+     * live node has a live parent, so one forward pass renumbers everything. */
+    void compact() {
+        if (!deadNodes) {
+            return;
+        }
+        std::vector<uint32_t> moved(nodes.size());
+        uint32_t live = 0;
+        for (uint32_t i = 0; i < nodes.size(); i++) {
+            if (nodes[i].dead) {
+                continue;
+            }
+            moved[i] = live;
+            if (i != ROOT) {
+                nodes[i].parent = moved[nodes[i].parent];
+            }
+            if (live != i) {
+                nodes[live] = std::move(nodes[i]);
+            }
+            live++;
+        }
+        nodes.erase(nodes.begin() + live, nodes.end());
+        deadNodes = 0;
+
+        /* Keep the names that a live node still uses. Nodes share names, so
+         * each one moves once. */
+        std::vector<uint32_t> movedName(names.size(), NONE);
+        std::vector<char> kept;
+        for (Node &node : nodes) {
+            if (!node.nameLength) {
+                node.nameOffset = 0;
+                continue;
+            }
+            uint32_t &to = movedName[node.nameOffset];
+            if (to == NONE) {
+                to = (uint32_t) kept.size();
+                kept.insert(kept.end(), names.begin() + node.nameOffset, names.begin() + node.nameOffset + node.nameLength);
+            }
+            node.nameOffset = to;
+        }
+        names = std::move(kept);
+    }
+
+    void buildEdges() {
+        /* The child count of each node, then where its next child goes */
+        std::vector<uint32_t> cursor(nodes.size(), 0);
+        uint32_t parents = 0;
+        uint32_t statics = 0;
+        for (uint32_t i = 1; i < nodes.size(); i++) {
+            uint32_t parent = nodes[i].parent;
+            parents += cursor[parent]++ ? 0 : 1;
+            statics += (parent == ROOT || !isSpecialName(nameOf(nodes[i]))) ? 1 : 0;
+        }
+        uint32_t total = 0;
+        uint32_t longest = 0;
+        for (uint32_t i = 0; i < nodes.size(); i++) {
+            uint32_t count = cursor[i];
+            cursor[i] = total;
+            total += count;
+            longest = std::max(longest, count);
+        }
+        std::vector<uint32_t> lists(total);
+        for (uint32_t i = 1; i < nodes.size(); i++) {
+            lists[cursor[nodes[i].parent]++] = i;
+        }
+
+        /* Sorts by (priority, kind, name hash); a parameter or a wildcard keeps
+         * its place by the order it was added in */
+        struct Key {
+            uint64_t order;
+            uint32_t child;
+        };
+        std::vector<Key> keys;
+        keys.reserve(longest);
+
+        std::vector<uint32_t> sortedEdges;
+        sortedEdges.reserve((size_t) parents * CHILD_LIST_HEADER + total + statics);
+        uint32_t begin = 0;
+        for (uint32_t parent = 0; parent < nodes.size(); parent++) {
+            uint32_t end = cursor[parent];
+            if (begin == end) {
+                nodes[parent].childList = NONE;
+                continue;
+            }
+            uint32_t counts[CHILD_LIST_HEADER] = {0, 0, 0, 0};
+            keys.clear();
+            for (uint32_t i = begin; i < end; i++) {
+                const Node &node = nodes[lists[i]];
+                std::string_view name = nameOf(node);
+                /* 0 static, 1 parameter, 2 wildcard */
+                uint64_t kind = 0;
+                if (parent != ROOT && isSpecialName(name)) {
+                    kind = name[0] == ':' ? 1 : 2;
+                }
+                counts[(node.isHighPriority ? 0 : 2) + (kind ? 1 : 0)]++;
+                uint64_t order = ((node.isHighPriority ? 0ull : 4ull) | kind) << 32;
+                order |= kind ? (uint64_t) lists[i] : (uint64_t) hashName(name);
+                keys.push_back({order, lists[i]});
+            }
+            std::sort(keys.begin(), keys.end(), [](const Key &a, const Key &b) {
+                return a.order != b.order ? a.order < b.order : a.child < b.child;
+            });
+
+            nodes[parent].childList = (uint32_t) sortedEdges.size();
+            sortedEdges.insert(sortedEdges.end(), counts, counts + CHILD_LIST_HEADER);
+            const Key *key = keys.data();
+            for (uint32_t priority = 0; priority < 2; priority++) {
+                uint32_t run = counts[priority * 2];
+                for (uint32_t i = 0; i < run; i++) {
+                    sortedEdges.push_back((uint32_t) key[i].order);
+                }
+                for (uint32_t i = 0; i < run + counts[priority * 2 + 1]; i++) {
+                    sortedEdges.push_back(key[i].child);
+                }
+                key += run + counts[priority * 2 + 1];
+            }
+            begin = end;
+        }
+        edges = std::move(sortedEdges);
+    }
+
+    /* Gives back the capacity that growth left over. shrink_to_fit() does
+     * nothing in libstdc++ when exceptions are off. */
+    template <typename T>
+    static void trim(std::vector<T> &items) {
+        if (items.capacity() != items.size()) {
+            std::vector<T>(items.begin(), items.end()).swap(items);
+        }
+    }
+
+    /* Registration is done: sort the child lists and free the index */
+    void sortChildren() {
+        if (!sorted) {
+            compact();
+            buildEdges();
+            trim(nodes);
+            trim(names);
+            trim(handlerLinks);
+            sorted = true;
+        }
+        std::vector<uint32_t>().swap(lookup);
+        lookupCount = 0;
+        getMethod = sortedFind(ROOT, "GET", false);
+        anyMethod = sortedFind(ROOT, ANY_METHOD_TOKEN, false);
+        ready = true;
+    }
+
+    void insertHandler(uint32_t node, uint32_t handler) {
+        uint32_t link = freeHandlerLink;
+        if (link != NONE) {
+            freeHandlerLink = handlerLinks[link].next;
+            handlerLinks[link].handler = handler;
+        } else {
+            link = (uint32_t) handlerLinks.size();
+            handlerLinks.push_back({handler, NONE});
+        }
+        /* Insert handler in order sorted by priority (most significant 1 byte) */
+        uint32_t *slot = &nodes[node].firstHandler;
+        while (*slot != NONE && handlerLinks[*slot].handler <= handler) {
+            slot = &handlerLinks[*slot].next;
+        }
+        handlerLinks[link].next = *slot;
+        *slot = link;
     }
 
     /* Basically a pre-allocated stack */
@@ -163,15 +532,15 @@ private:
     }
 
     /* Executes as many handlers it can */
-    bool executeHandlers(Node *parent, int urlSegment, UserDataType &userData) {
+    bool executeHandlers(uint32_t parent, int urlSegment, UserDataType &userData) {
 
         auto [segment, isStop] = getUrlSegment(urlSegment);
 
         /* If we are on STOP, return where we may stand */
         if (isStop) {
             /* We have reached accross the entire URL with no stoppage, execute */
-            for (uint32_t handler : parent->handlers) {
-                if (handlers[handler & HANDLER_MASK](this)) {
+            for (uint32_t link = nodes[parent].firstHandler; link != NONE; link = handlerLinks[link].next) {
+                if (handlers[handlerLinks[link].handler & HANDLER_MASK](this)) {
                     return true;
                 }
             }
@@ -179,68 +548,127 @@ private:
             return false;
         }
 
-        for (auto &p : parent->children) {
-            if (p->name.starts_with('*')) {
-                /* Wildcard match (can be seen as a shortcut) */
-                for (uint32_t handler : p->handlers) {
-                    if (handlers[handler & HANDLER_MASK](this)) {
-                        return true;
-                    }
-                }
-            } else if (p->name.starts_with(':') && !segment.empty()) {
-                /* Parameter match */
-                routeParameters.push(segment);
-                if (executeHandlers(p.get(), urlSegment + 1, userData)) {
-                    return true;
-                }
-                routeParameters.pop();
-            } else if (p->name == segment) {
-                /* Static match */
-                if (executeHandlers(p.get(), urlSegment + 1, userData)) {
+        uint32_t list = nodes[parent].childList;
+        if (list == NONE) {
+            return false;
+        }
+
+        uint32_t first = list + CHILD_LIST_HEADER;
+        for (uint32_t priority = 0; priority < 2; priority++) {
+            uint32_t statics = edges[list + priority * 2];
+            uint32_t specials = edges[list + priority * 2 + 1];
+
+            /* Static match */
+            if (statics) {
+                uint32_t match = findStatic(first, statics, segment);
+                if (match != NONE && executeHandlers(match, urlSegment + 1, userData)) {
                     return true;
                 }
             }
+
+            for (uint32_t i = first + statics * 2; i < first + statics * 2 + specials; i++) {
+                uint32_t child = edges[i];
+                if (names[nodes[child].nameOffset] == '*') {
+                    /* Wildcard match (can be seen as a shortcut) */
+                    for (uint32_t link = nodes[child].firstHandler; link != NONE; link = handlerLinks[link].next) {
+                        if (handlers[handlerLinks[link].handler & HANDLER_MASK](this)) {
+                            return true;
+                        }
+                    }
+                } else if (!segment.empty()) {
+                    /* Parameter match */
+                    routeParameters.push(segment);
+                    if (executeHandlers(child, urlSegment + 1, userData)) {
+                        return true;
+                    }
+                    routeParameters.pop();
+                }
+            }
+            first += statics * 2 + specials;
         }
         return false;
     }
 
     /* Scans for one matching handler, returning the handler and its priority or UINT32_MAX for not found */
     uint32_t findHandler(std::string_view method, std::string_view pattern, uint32_t priority) {
-        for (const std::unique_ptr<Node> &node : root.children) {
-            if (method == node->name) {
-                setUrl(pattern);
-                Node *n = node.get();
-                for (int i = 0; !getUrlSegment(i).second; i++) {
-                    /* Go to next segment or quit */
-                    std::string segment(getUrlSegment(i).first);
-                    Node *next = nullptr;
-                    for (const std::unique_ptr<Node> &child : n->children) {
-                        if (((segment.starts_with(':') && child->name.starts_with(':')) || child->name == segment) && child->isHighPriority == (priority == HIGH_PRIORITY)) {
-                            next = child.get();
-                            break;
-                        }
-                    }
-                    if (!next) {
-                        return UINT32_MAX;
-                    }
-                    n = next;
-                }
-                /* Seek for a priority match in the found node */
-                for (unsigned int i = 0; i < n->handlers.size(); i++) {
-                    if ((n->handlers[i] & ~HANDLER_MASK) == priority) {
-                        return n->handlers[i];
-                    }
-                }
+        uint32_t node = findChild(ROOT, method, false);
+        if (node == NONE) {
+            return UINT32_MAX;
+        }
+        setUrl(pattern);
+        for (int i = 0; !getUrlSegment(i).second; i++) {
+            std::string_view segment = getUrlSegment(i).first;
+            if (segment.starts_with(':')) {
+                /* Parameter routes are named only : */
+                segment = segment.substr(0, 1);
+            }
+            /* Go to next segment or quit */
+            node = findChild(node, segment, priority == HIGH_PRIORITY);
+            if (node == NONE) {
                 return UINT32_MAX;
+            }
+        }
+        /* Seek for a priority match in the found node */
+        for (uint32_t link = nodes[node].firstHandler; link != NONE; link = handlerLinks[link].next) {
+            if ((handlerLinks[link].handler & ~HANDLER_MASK) == priority) {
+                return handlerLinks[link].handler;
             }
         }
         return UINT32_MAX;
     }
 
+    /* Removes the handler from every node, lowers the handlers above it by one
+     * and marks the nodes that are left with no handler and no child as dead */
+    void cull(uint32_t handler) {
+        std::vector<uint32_t> children(nodes.size(), 0);
+        for (uint32_t i = 1; i < nodes.size(); i++) {
+            if (!nodes[i].dead) {
+                children[nodes[i].parent]++;
+            }
+        }
+        bool anyDied = false;
+        /* Children have higher indices than their parent, so this is depth first */
+        for (uint32_t i = (uint32_t) nodes.size() - 1; i != ROOT; i--) {
+            Node &node = nodes[i];
+            if (node.dead) {
+                continue;
+            }
+            uint32_t *slot = &node.firstHandler;
+            while (*slot != NONE) {
+                HandlerLink &link = handlerLinks[*slot];
+                if (link.handler == handler) {
+                    uint32_t removed = *slot;
+                    *slot = link.next;
+                    link.next = freeHandlerLink;
+                    freeHandlerLink = removed;
+                    continue;
+                }
+                if ((link.handler & HANDLER_MASK) > (handler & HANDLER_MASK)) {
+                    link.handler = ((link.handler & HANDLER_MASK) - 1) | (link.handler & ~HANDLER_MASK);
+                }
+                slot = &link.next;
+            }
+            if (node.firstHandler == NONE && !children[i]) {
+                node.dead = true;
+                children[node.parent]--;
+                deadNodes++;
+                anyDied = true;
+            }
+        }
+        if (anyDied) {
+            std::vector<uint32_t>().swap(lookup);
+            lookupCount = 0;
+            sorted = false;
+            ready = false;
+        }
+    }
+
 public:
     HttpRouter() {
+        nodes.push_back({0, 0, NONE, NONE, NONE, false, false});
         /* Always have ANY route */
-        getNode(&root, std::string(ANY_METHOD_TOKEN), false);
+        uint32_t stored = NONE;
+        getNode(ROOT, ANY_METHOD_TOKEN, false, stored);
     }
 
     std::pair<int, std::string_view *> getParameters() {
@@ -253,27 +681,26 @@ public:
 
     /* Fast path */
     bool route(std::string_view method, std::string_view url) {
+        if (!ready) [[unlikely]] {
+            sortChildren();
+        }
+
         /* Reset url parsing cache */
         setUrl(url);
         routeParameters.reset();
 
         /* Begin by finding the method node */
-        for (auto &p : root.children) {
-            if (p->name == method) {
-                /* Then route the url */
-                if (executeHandlers(p.get(), 0, userData)) {
-                    return true;
-                } else {
-                    break;
-                }
-            }
+        uint32_t any = anyMethod;
+        uint32_t node = method == "GET" ? getMethod : sortedFind(ROOT, method, false);
+        if (node != NONE && executeHandlers(node, 0, userData)) {
+            return true;
         }
 
-        /* Always test any route last (this check should not be necessary if we always have at least one handler) */
-        if (root.children.empty()) [[unlikely]] {
+        /* Always test any route last */
+        if (any == NONE) {
             return false;
         }
-        return executeHandlers(root.children.back().get(), 0, userData);
+        return executeHandlers(any, 0, userData);
     }
 
     /* Adds the corresponding entires in matching tree and handler list */
@@ -281,78 +708,29 @@ public:
         /* First remove existing handler */
         remove(methods[0], pattern, priority);
 
+        /* Where this call stored each segment of the pattern in names */
+        uint32_t stored[MAX_URL_SEGMENTS];
+        std::fill(stored, stored + MAX_URL_SEGMENTS, NONE);
+
         for (const std::string_view method : methods) {
             /* Lookup method */
-            Node *node = getNode(&root, method, false);
+            uint32_t storedMethod = NONE;
+            uint32_t node = getNode(ROOT, method, false, storedMethod);
             /* Iterate over all segments */
             setUrl(pattern);
             for (int i = 0; !getUrlSegment(i).second; i++) {
-                std::string strippedSegment(getUrlSegment(i).first);
-                if (strippedSegment.length() > 1 && strippedSegment[0] == ':') {
+                std::string_view segment = getUrlSegment(i).first;
+                if (segment.length() > 1 && segment[0] == ':') {
                     /* Parameter routes must be named only : */
-                    strippedSegment.resize(1);
+                    segment = segment.substr(0, 1);
                 }
-                node = getNode(node, strippedSegment, priority == HIGH_PRIORITY);
+                node = getNode(node, segment, priority == HIGH_PRIORITY, stored[i]);
             }
-            /* Insert handler in order sorted by priority (most significant 1 byte) */
-            uint32_t new_priority(priority | handlers.size());
-            node->handlers.insert(std::upper_bound(node->handlers.begin(), node->handlers.end(), new_priority), new_priority);
+            insertHandler(node, priority | (uint32_t) handlers.size());
         }
 
         /* Alloate this handler */
         handlers.emplace_back(std::move(handler));
-
-        /* ANY method must be last, GET must be first */
-        std::sort(root.children.begin(), root.children.end(), [](const auto &a, const auto &b) {
-            if (a->name == "GET" && b->name != "GET") {
-                return true;
-            } else if (b->name == "GET" && a->name != "GET") {
-                return false;
-            } else if (a->name == ANY_METHOD_TOKEN && b->name != ANY_METHOD_TOKEN) {
-                return false;
-            } else if (b->name == ANY_METHOD_TOKEN && a->name != ANY_METHOD_TOKEN) {
-                return true;
-            } else {
-                return a->name < b->name;
-            }
-        });
-    }
-
-    bool cullNode(Node *parent, Node *node, uint32_t handler) {
-        /* For all children */
-        for (unsigned int i = 0; i < node->children.size(); ) {
-            /* Optimization todo: only enter those with same isHighPrioirty */
-            /* Enter child so we get depth first */
-            if (!cullNode(node, node->children[i].get(), handler)) {
-                /* Only increase if this node was not removed */
-                i++;
-            }
-        }
-
-        /* Cull this node (but skip the root node) */
-        if (parent /*&& parent != &root*/) {
-            /* Scan for equal (remove), greater (lower by 1) */
-            for (auto it = node->handlers.begin(); it != node->handlers.end(); ) {
-                if ((*it & HANDLER_MASK) > (handler & HANDLER_MASK)) {
-                    *it = ((*it & HANDLER_MASK) - 1) | (*it & ~HANDLER_MASK);
-                } else if (*it == handler) {
-                    it = node->handlers.erase(it);
-                    continue;
-                }
-                it++;
-            }
-
-            /* If we have no children and no handlers, remove us from the parent->children list */
-            if (!node->handlers.size() && !node->children.size()) {
-                parent->children.erase(std::find_if(parent->children.begin(), parent->children.end(), [node](const std::unique_ptr<Node> &a) {
-                    return a.get() == node;
-                }));
-                /* Returning true means we removed node from parent */
-                return true;
-            }
-        }
-
-        return false;
     }
 
     /* Removes ALL routes with the same handler as can be found with the given parameters.
@@ -365,11 +743,7 @@ public:
             return false;
         }
 
-        /* Cull the entire tree */
-        /* For all nodes in depth first tree traveral;
-         * if node contains handler - remove the handler -
-         * if node holds no handlers after removal, remove the node and return */
-        cullNode(nullptr, &root, handler);
+        cull(handler);
 
         /* Now remove the actual handler */
         handlers.erase(handlers.begin() + (handler & HANDLER_MASK));
