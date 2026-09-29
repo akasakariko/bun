@@ -679,6 +679,14 @@ public:
         return userData;
     }
 
+    /* Call when the routes are registered, so that the first route() does not
+     * pay for the sort */
+    void sortRoutes() {
+        if (!ready) {
+            sortChildren();
+        }
+    }
+
     /* Fast path */
     bool route(std::string_view method, std::string_view url) {
         if (!ready) [[unlikely]] {

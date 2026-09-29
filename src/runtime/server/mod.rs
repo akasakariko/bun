@@ -2760,6 +2760,11 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
             ffi::NodeHTTP_assignOnNodeJSCompat(SSL, std::ptr::from_mut(app).cast::<c_void>());
         }
 
+        app.sort_routes();
+        for_each_mux_app!(self, |mux| {
+            mux.sort_routes();
+        });
+
         route_list_value
     }
 
