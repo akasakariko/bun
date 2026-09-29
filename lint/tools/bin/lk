@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs one heavy command (build, cargo, test) at a time on this machine, for every worktree.
+# usage: /workspace/tools/lk <command> [args...]
+exec flock /workspace/tools/heavy.lock "$@"

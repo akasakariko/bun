@@ -1,0 +1,3 @@
+lint/benchroot/
+lint/measure/*/bin/
+*.cg
