@@ -554,8 +554,14 @@ describe.concurrent("an assigned cause", () => {
     });
   });
 
+  const errorLines = text =>
+    text
+      .split("\n")
+      .filter(line => /^\s*(error: |AggregateError: |\[Error \.\.\.\])/.test(line))
+      .map(line => line.trim());
+
   // The queue prints an AggregateError itself, then its members.
-  test("a cause that is an AggregateError prints its members", async () => {
+  test("an AggregateError in the queue prints its members once", async () => {
     const shapes = {
       "the cause of a cause, assigned": `
         const mid = new Error("mid");
@@ -563,27 +569,76 @@ describe.concurrent("an assigned cause", () => {
         throw new Error("top", { cause: mid });`,
       "the cause, from the constructor": `
         throw new Error("top", { cause: new AggregateError([new Error("member")], "agg") });`,
+      "an own property that is not the cause": `
+        const top = new Error("top");
+        top.other = new AggregateError([new Error("member")], "agg");
+        throw top;`,
+      "errors is enumerable": `
+        const agg = new AggregateError([new Error("member")], "agg");
+        Object.defineProperty(agg, "errors", { enumerable: true });
+        throw new Error("top", { cause: agg });`,
+      "no members": `
+        throw new Error("top", { cause: new AggregateError([], "agg") });`,
     };
-    const seen = {};
-    for (const [name, source] of Object.entries(shapes)) {
-      const { stderr, exitCode } = await run(source);
-      seen[name] = {
-        renders: stderr
-          .split("\n")
-          .filter(line => /^\s*(error|AggregateError): /.test(line))
-          .map(line => line.trim()),
-        exitCode,
-      };
-    }
+    const names = Object.keys(shapes);
+    const results = await Promise.all(names.map(name => run(shapes[name])));
+    const seen = Object.fromEntries(
+      names.map((name, i) => [name, { renders: errorLines(results[i].stderr), exitCode: results[i].exitCode }]),
+    );
+    const withMember = { renders: ["error: top", "AggregateError: agg", "error: member"], exitCode: 1 };
     expect(seen).toEqual({
       "the cause of a cause, assigned": {
         renders: ["error: top", "error: mid", "AggregateError: agg", "error: member"],
         exitCode: 1,
       },
-      "the cause, from the constructor": {
-        renders: ["error: top", "AggregateError: agg", "error: member"],
-        exitCode: 1,
+      "the cause, from the constructor": withMember,
+      "an own property that is not the cause": withMember,
+      "errors is enumerable": withMember,
+      "no members": { renders: ["error: top", "AggregateError: agg"], exitCode: 1 },
+    });
+  });
+
+  test("console.log and Bun.inspect print the same lines as for a cause from the constructor", async () => {
+    const aggregate = `new AggregateError([new Error("member")], "agg")`;
+    const values = {
+      "assigned, chain of 4": `(() => { ${assigned(4)} return e; })()`,
+      "constructed, chain of 4": `(() => { ${constructed(4)} return e; })()`,
+      "assigned, AggregateError": `Object.assign(new Error("top"), { cause: ${aggregate} })`,
+      "constructed, AggregateError": `new Error("top", { cause: ${aggregate} })`,
+    };
+    const { stdout, exitCode } = await run(
+      Object.entries(values)
+        .map(
+          ([name, value]) => `{
+            const value = ${value};
+            console.log(${JSON.stringify("console.log: " + name)});
+            console.log(value);
+            console.log(${JSON.stringify("Bun.inspect: " + name)});
+            console.log(Bun.inspect(value));
+          }`,
+        )
+        .join("\n"),
+    );
+    const seen = {};
+    let current;
+    for (const line of stdout.split("\n")) {
+      if (/^(console\.log|Bun\.inspect): /.test(line)) seen[line] = current = [];
+      else current?.push(...errorLines(line));
+    }
+    const capped = ["error: l3", "error: l2", "error: l1", "[Error ...]"];
+    const withMember = ["error: top", "AggregateError: agg", "error: member"];
+    expect({ seen, exitCode }).toEqual({
+      seen: {
+        "console.log: assigned, chain of 4": capped,
+        "Bun.inspect: assigned, chain of 4": chain(4),
+        "console.log: constructed, chain of 4": capped,
+        "Bun.inspect: constructed, chain of 4": chain(4),
+        "console.log: assigned, AggregateError": withMember,
+        "Bun.inspect: assigned, AggregateError": withMember,
+        "console.log: constructed, AggregateError": withMember,
+        "Bun.inspect: constructed, AggregateError": withMember,
       },
+      exitCode: 0,
     });
   });
 

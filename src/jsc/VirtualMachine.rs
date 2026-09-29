@@ -7089,6 +7089,12 @@ impl VirtualMachine {
                 }
 
                 let kind = value.js_type();
+                if kind.is_array()
+                    && field.eq_ascii(b"errors")
+                    && error_instance.is_aggregate_error(global_ref)
+                {
+                    continue;
+                }
                 let is_cause = field.eq_ascii(b"cause");
                 if kind == JSType::ErrorInstance && (is_cause || !prev_had_errors) {
                     if is_cause {
