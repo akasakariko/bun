@@ -77,8 +77,10 @@ private:
         uint32_t firstHandler;
         /* Offset of this node's child list in edges, NONE for a leaf */
         uint32_t childList;
-        bool isHighPriority;
-        bool dead;
+        /* Live children. A node with no handler and no child is dropped. */
+        uint32_t children : 30;
+        uint32_t isHighPriority : 1;
+        uint32_t dead : 1;
     };
 
     struct HandlerLink {
@@ -91,6 +93,11 @@ private:
     std::vector<HandlerLink> handlerLinks;
     uint32_t freeHandlerLink = NONE;
     uint32_t deadNodes = 0;
+    /* The method nodes, which are the live children of the root */
+    std::vector<uint32_t> methodNodes;
+    /* A removed handler leaves an empty slot in handlers until the next sort,
+     * so that a removal does not renumber every handler after it */
+    uint32_t removedHandlers = 0;
 
     /* One list per node that has children: four counts (high static, high
      * special, normal static, normal special), then the children in that
@@ -109,10 +116,10 @@ private:
     /* True when edges is current and lookup is freed */
     bool ready = false;
 
-    /* Most requests are GET, and ANY is tried for every request that no
-     * method route took, so route() does not search for either */
+    /* Most requests are GET, and the last method is tried for every request
+     * that no method route took, so route() does not search for either */
     uint32_t getMethod = NONE;
-    uint32_t anyMethod = NONE;
+    uint32_t lastMethod = NONE;
 
     std::string_view nameOf(const Node &node) const {
         return {names.data() + node.nameOffset, node.nameLength};
@@ -192,6 +199,27 @@ private:
         }
         lookup[i] = index;
         lookupCount++;
+    }
+
+    /* Takes a node out of the index. The entries after it in its probe run move
+     * back, so that a search still reaches them. */
+    void lookupErase(uint32_t index) {
+        size_t mask = lookup.size() - 1;
+        const Node &node = nodes[index];
+        size_t hole = hashKey(node.parent, node.isHighPriority, nameOf(node)) & mask;
+        while (lookup[hole] != index) {
+            hole = (hole + 1) & mask;
+        }
+        for (size_t next = (hole + 1) & mask; lookup[next] != NONE; next = (next + 1) & mask) {
+            const Node &moved = nodes[lookup[next]];
+            size_t home = hashKey(moved.parent, moved.isHighPriority, nameOf(moved)) & mask;
+            if (((next - home) & mask) >= ((next - hole) & mask)) {
+                lookup[hole] = lookup[next];
+                hole = next;
+            }
+        }
+        lookup[hole] = NONE;
+        lookupCount--;
     }
 
     void rebuildLookup(size_t capacity) {
@@ -294,10 +322,36 @@ private:
             names.insert(names.end(), child.begin(), child.end());
         }
         uint32_t index = (uint32_t) nodes.size();
-        nodes.push_back({stored, (uint32_t) child.size(), parent, NONE, NONE, isHighPriority, false});
+        nodes.push_back({stored, (uint32_t) child.size(), parent, NONE, NONE, 0, isHighPriority, false});
+        nodes[parent].children++;
+        if (parent == ROOT) {
+            methodNodes.push_back(index);
+        }
         lookupInsert(index);
         sorted = false;
         return index;
+    }
+
+    /* Drops the node if it has no handler and no child, and then its parent */
+    void dropIfEmpty(uint32_t index) {
+        while (index != ROOT) {
+            Node &node = nodes[index];
+            if (node.firstHandler != NONE || node.children) {
+                return;
+            }
+            if (!lookup.empty()) {
+                lookupErase(index);
+            }
+            node.dead = true;
+            deadNodes++;
+            sorted = false;
+            uint32_t parent = node.parent;
+            nodes[parent].children--;
+            if (parent == ROOT) {
+                methodNodes.erase(std::find(methodNodes.begin(), methodNodes.end(), index));
+            }
+            index = parent;
+        }
     }
 
     /* Drops dead nodes. A child always has a higher index than its parent and a
@@ -323,6 +377,9 @@ private:
         }
         nodes.erase(nodes.begin() + live, nodes.end());
         deadNodes = 0;
+        for (uint32_t &method : methodNodes) {
+            method = moved[method];
+        }
 
         /* Keep the names that a live node still uses. Nodes share names, so
          * each one moves once. */
@@ -421,6 +478,34 @@ private:
         edges = std::move(sortedEdges);
     }
 
+    /* Closes the gaps that removed handlers left. The handlers keep their order,
+     * which is the order handlers of one priority run in. */
+    void compactHandlers() {
+        if (!removedHandlers) {
+            return;
+        }
+        std::vector<uint32_t> renumbered(handlers.size(), NONE);
+        uint32_t live = 0;
+        for (uint32_t i = 0; i < handlers.size(); i++) {
+            if (!handlers[i]) {
+                continue;
+            }
+            renumbered[i] = live;
+            if (live != i) {
+                handlers[live] = std::move(handlers[i]);
+            }
+            live++;
+        }
+        handlers.erase(handlers.begin() + live, handlers.end());
+        for (const Node &node : nodes) {
+            for (uint32_t link = node.dead ? NONE : node.firstHandler; link != NONE; link = handlerLinks[link].next) {
+                uint32_t handler = handlerLinks[link].handler;
+                handlerLinks[link].handler = (handler & ~HANDLER_MASK) | renumbered[handler & HANDLER_MASK];
+            }
+        }
+        removedHandlers = 0;
+    }
+
     /* Gives back the capacity that growth left over. shrink_to_fit() does
      * nothing in libstdc++ when exceptions are off. */
     template <typename T>
@@ -430,20 +515,42 @@ private:
         }
     }
 
+    static bool isLaterMethod(std::string_view method, std::string_view other) {
+        if (method == "GET" || other == ANY_METHOD_TOKEN) {
+            return false;
+        }
+        return other == "GET" || method == ANY_METHOD_TOKEN || method > other;
+    }
+
     /* Registration is done: sort the child lists and free the index */
     void sortChildren() {
+        compactHandlers();
         if (!sorted) {
             compact();
             buildEdges();
             trim(nodes);
             trim(names);
             trim(handlerLinks);
+            trim(methodNodes);
             sorted = true;
         }
         std::vector<uint32_t>().swap(lookup);
         lookupCount = 0;
-        getMethod = sortedFind(ROOT, "GET", false);
-        anyMethod = sortedFind(ROOT, ANY_METHOD_TOKEN, false);
+
+        /* The methods are ordered GET first, ANY last and the rest by name, and
+         * route() falls back to the last one. That is ANY unless a removal
+         * dropped an ANY node that had no route. */
+        getMethod = NONE;
+        lastMethod = NONE;
+        for (uint32_t method : methodNodes) {
+            std::string_view name = nameOf(nodes[method]);
+            if (name == "GET") {
+                getMethod = method;
+            }
+            if (lastMethod == NONE || isLaterMethod(name, nameOf(nodes[lastMethod]))) {
+                lastMethod = method;
+            }
+        }
         ready = true;
     }
 
@@ -589,24 +696,29 @@ private:
         return false;
     }
 
-    /* Scans for one matching handler, returning the handler and its priority or UINT32_MAX for not found */
-    uint32_t findHandler(std::string_view method, std::string_view pattern, uint32_t priority) {
-        uint32_t node = findChild(ROOT, method, false);
-        if (node == NONE) {
-            return UINT32_MAX;
-        }
+    /* Walks the pattern down from a method node */
+    uint32_t findPattern(uint32_t node, std::string_view pattern, bool isHighPriority) {
         setUrl(pattern);
-        for (int i = 0; !getUrlSegment(i).second; i++) {
+        for (int i = 0; node != NONE && !getUrlSegment(i).second; i++) {
             std::string_view segment = getUrlSegment(i).first;
             if (segment.starts_with(':')) {
                 /* Parameter routes are named only : */
                 segment = segment.substr(0, 1);
             }
             /* Go to next segment or quit */
-            node = findChild(node, segment, priority == HIGH_PRIORITY);
-            if (node == NONE) {
-                return UINT32_MAX;
-            }
+            node = findChild(node, segment, isHighPriority);
+        }
+        return node;
+    }
+
+    /* Scans for one matching handler, returning the handler and its priority or UINT32_MAX for not found */
+    uint32_t findHandler(std::string_view method, std::string_view pattern, uint32_t priority) {
+        uint32_t node = findChild(ROOT, method, false);
+        if (node != NONE) {
+            node = findPattern(node, pattern, priority == HIGH_PRIORITY);
+        }
+        if (node == NONE) {
+            return UINT32_MAX;
         }
         /* Seek for a priority match in the found node */
         for (uint32_t link = nodes[node].firstHandler; link != NONE; link = handlerLinks[link].next) {
@@ -617,55 +729,23 @@ private:
         return UINT32_MAX;
     }
 
-    /* Removes the handler from every node, lowers the handlers above it by one
-     * and marks the nodes that are left with no handler and no child as dead */
-    void cull(uint32_t handler) {
-        std::vector<uint32_t> children(nodes.size(), 0);
-        for (uint32_t i = 1; i < nodes.size(); i++) {
-            if (!nodes[i].dead) {
-                children[nodes[i].parent]++;
+    bool unlinkHandler(uint32_t node, uint32_t handler) {
+        for (uint32_t *slot = &nodes[node].firstHandler; *slot != NONE; slot = &handlerLinks[*slot].next) {
+            HandlerLink &link = handlerLinks[*slot];
+            if (link.handler == handler) {
+                uint32_t removed = *slot;
+                *slot = link.next;
+                link.next = freeHandlerLink;
+                freeHandlerLink = removed;
+                return true;
             }
         }
-        bool anyDied = false;
-        /* Children have higher indices than their parent, so this is depth first */
-        for (uint32_t i = (uint32_t) nodes.size() - 1; i != ROOT; i--) {
-            Node &node = nodes[i];
-            if (node.dead) {
-                continue;
-            }
-            uint32_t *slot = &node.firstHandler;
-            while (*slot != NONE) {
-                HandlerLink &link = handlerLinks[*slot];
-                if (link.handler == handler) {
-                    uint32_t removed = *slot;
-                    *slot = link.next;
-                    link.next = freeHandlerLink;
-                    freeHandlerLink = removed;
-                    continue;
-                }
-                if ((link.handler & HANDLER_MASK) > (handler & HANDLER_MASK)) {
-                    link.handler = ((link.handler & HANDLER_MASK) - 1) | (link.handler & ~HANDLER_MASK);
-                }
-                slot = &link.next;
-            }
-            if (node.firstHandler == NONE && !children[i]) {
-                node.dead = true;
-                children[node.parent]--;
-                deadNodes++;
-                anyDied = true;
-            }
-        }
-        if (anyDied) {
-            std::vector<uint32_t>().swap(lookup);
-            lookupCount = 0;
-            sorted = false;
-            ready = false;
-        }
+        return false;
     }
 
 public:
     HttpRouter() {
-        nodes.push_back({0, 0, NONE, NONE, NONE, false, false});
+        nodes.push_back({0, 0, NONE, NONE, NONE, 0, false, false});
         /* Always have ANY route */
         uint32_t stored = NONE;
         getNode(ROOT, ANY_METHOD_TOKEN, false, stored);
@@ -698,23 +778,27 @@ public:
         routeParameters.reset();
 
         /* Begin by finding the method node */
-        uint32_t any = anyMethod;
+        uint32_t last = lastMethod;
         uint32_t node = method == "GET" ? getMethod : sortedFind(ROOT, method, false);
         if (node != NONE && executeHandlers(node, 0, userData)) {
             return true;
         }
 
         /* Always test any route last */
-        if (any == NONE) {
+        if (last == NONE) {
             return false;
         }
-        return executeHandlers(any, 0, userData);
+        return executeHandlers(last, 0, userData);
     }
 
     /* Adds the corresponding entires in matching tree and handler list */
     void add(std::span<const std::string_view> methods, std::string_view pattern, MoveOnlyFunction<bool(HttpRouter *)> &&handler, uint32_t priority = MEDIUM_PRIORITY) {
         /* First remove existing handler */
         remove(methods[0], pattern, priority);
+
+        if (handlers.size() >= HANDLER_MASK) {
+            compactHandlers();
+        }
 
         /* Where this call stored each segment of the pattern in names */
         uint32_t stored[MAX_URL_SEGMENTS];
@@ -751,10 +835,26 @@ public:
             return false;
         }
 
-        cull(handler);
+        /* add() put the handler on the node of this pattern under each of its
+         * methods, so no other node can hold it */
+        for (size_t i = methodNodes.size(); i-- > 0;) {
+            uint32_t node = findPattern(methodNodes[i], pattern, priority == HIGH_PRIORITY);
+            if (node != NONE && unlinkHandler(node, handler)) {
+                dropIfEmpty(node);
+            }
+        }
+
+        /* A removal drops every empty node, and an ANY node that nothing was
+         * added to is one */
+        uint32_t any = findChild(ROOT, ANY_METHOD_TOKEN, false);
+        if (any != NONE) {
+            dropIfEmpty(any);
+        }
 
         /* Now remove the actual handler */
-        handlers.erase(handlers.begin() + (handler & HANDLER_MASK));
+        handlers[handler & HANDLER_MASK] = nullptr;
+        removedHandlers++;
+        ready = false;
 
         return true;
     }

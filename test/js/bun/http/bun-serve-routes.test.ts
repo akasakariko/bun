@@ -1,6 +1,6 @@
 import type { BunRequest, ServeOptions, Server } from "bun";
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, withoutAggressiveGC } from "harness";
 import net from "node:net";
 
 describe("path parameters", () => {
@@ -1131,19 +1131,21 @@ describe("many routes", () => {
       return dt;
     }
 
-    // Warm up JIT + allocator so the small sample is not dominated by
-    // first-call overhead.
-    timeBuild(300);
+    withoutAggressiveGC(() => {
+      // Warm up JIT + allocator so the small sample is not dominated by
+      // first-call overhead.
+      timeBuild(300);
 
-    // The best of several runs for each sample to cut scheduling jitter; the
-    // ratio is what matters, not the absolute times.
-    const small = Math.min(timeBuild(300), timeBuild(300), timeBuild(300));
-    const large = Math.min(timeBuild(2400), timeBuild(2400));
-    const ratio = large / small;
+      // The best of several runs for each sample to cut scheduling jitter; the
+      // ratio is what matters, not the absolute times.
+      const small = Math.min(timeBuild(300), timeBuild(300), timeBuild(300));
+      const large = Math.min(timeBuild(2400), timeBuild(2400));
+      const ratio = large / small;
 
-    // 8x the routes. Linear ~= 8x; the old O(N^2) path measured 50-80x here.
-    // Printed alongside the assertion so a failure shows the raw timings.
-    expect({ small, large, ratio, linear: ratio < 24 }).toMatchObject({ linear: true });
+      // 8x the routes. Linear ~= 8x; the old O(N^2) path measured 50-80x here.
+      // Printed alongside the assertion so a failure shows the raw timings.
+      expect({ small, large, ratio, linear: ratio < 24 }).toMatchObject({ linear: true });
+    });
   });
 
   test("routes to the right handler in a large flat table", async () => {
@@ -1199,6 +1201,27 @@ describe("many routes", () => {
 
     expect((await fetch(`${base}/other0`)).status).toBe(404);
     expect(await fetch(`${base}/leaf500`).then(r => r.text())).toBe("500");
+  });
+
+  // A static route that names HEAD registers HEAD twice, and the second
+  // registration replaces the first.
+  test("static routes that name HEAD are all served in a large table", async () => {
+    const n = 1000;
+    const routes: Record<string, { GET: Response; HEAD: Response }> = {};
+    for (let i = 0; i < n; i++) {
+      routes[`/file${i}`] = { GET: new Response(`get${i}`), HEAD: new Response(`head-${i}`) };
+    }
+    using server = Bun.serve({ port: 0, routes, fetch: () => new Response("fallback", { status: 404 }) });
+    const base = `http://127.0.0.1:${server.port}`;
+
+    const seen: unknown[] = [];
+    for (const i of [0, 499, n - 1]) {
+      seen.push(await fetch(`${base}/file${i}`).then(r => r.text()));
+      const head = await fetch(`${base}/file${i}`, { method: "HEAD" });
+      seen.push([head.status, head.headers.get("content-length"), await head.text()]);
+    }
+    seen.push((await fetch(`${base}/file${n}`)).status);
+    expect(seen).toEqual(["get0", [200, "6", ""], "get499", [200, "8", ""], "get999", [200, "8", ""], 404]);
   });
 
   test("a route handler can reload() the table it was matched in", async () => {
