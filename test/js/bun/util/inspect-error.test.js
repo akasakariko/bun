@@ -510,3 +510,91 @@ describe.concurrent("AggregateError whose errors cannot be walked", () => {
     expect(exitCode).toBe(1);
   });
 });
+
+// An Error-valued `cause` is printed after the error that holds it, once,
+// for a `cause` that was assigned and for a `cause` from the constructor.
+describe.concurrent("an assigned cause", () => {
+  const assigned = n =>
+    `let e = new Error("leaf"); for (let i = 0; i < ${n}; i++) { const x = new Error("l" + i); x.cause = e; e = x; }`;
+  const constructed = n =>
+    `let e = new Error("leaf"); for (let i = 0; i < ${n}; i++) { e = new Error("l" + i, { cause: e }); }`;
+
+  async function run(source) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", source],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+  const renders = text =>
+    text
+      .split("\n")
+      .filter(line => /^\s*error: /.test(line))
+      .map(line => line.trim());
+  const chain = n => [...Array.from({ length: n }, (_, i) => "error: l" + (n - 1 - i)), "error: leaf"];
+
+  test("Bun.inspect renders each error of the chain once", async () => {
+    const { stdout, exitCode } = await run(
+      [3, 6, 10]
+        .map(n => `{ ${assigned(n)} console.log("chain of " + ${n}); console.log(Bun.inspect(e, { depth: 100 })); }`)
+        .join("\n"),
+    );
+    const seen = {};
+    let current;
+    for (const line of stdout.split("\n")) {
+      if (line.startsWith("chain of ")) seen[line] = current = [];
+      else if (/^\s*error: /.test(line)) current.push(line.trim());
+    }
+    expect({ seen, exitCode }).toEqual({
+      seen: { "chain of 3": chain(3), "chain of 6": chain(6), "chain of 10": chain(10) },
+      exitCode: 0,
+    });
+  });
+
+  // The queue prints an AggregateError itself, then its members.
+  test("a cause that is an AggregateError prints its members", async () => {
+    const shapes = {
+      "the cause of a cause, assigned": `
+        const mid = new Error("mid");
+        mid.cause = new AggregateError([new Error("member")], "agg");
+        throw new Error("top", { cause: mid });`,
+      "the cause, from the constructor": `
+        throw new Error("top", { cause: new AggregateError([new Error("member")], "agg") });`,
+    };
+    const seen = {};
+    for (const [name, source] of Object.entries(shapes)) {
+      const { stderr, exitCode } = await run(source);
+      seen[name] = {
+        renders: stderr
+          .split("\n")
+          .filter(line => /^\s*(error|AggregateError): /.test(line))
+          .map(line => line.trim()),
+        exitCode,
+      };
+    }
+    expect(seen).toEqual({
+      "the cause of a cause, assigned": {
+        renders: ["error: top", "error: mid", "AggregateError: agg", "error: member"],
+        exitCode: 1,
+      },
+      "the cause, from the constructor": {
+        renders: ["error: top", "AggregateError: agg", "error: member"],
+        exitCode: 1,
+      },
+    });
+  });
+
+  test("throw prints the same lines as for a cause from the constructor", async () => {
+    const [a, c] = await Promise.all([run(`${assigned(4)} throw e;`), run(`${constructed(4)} throw e;`)]);
+    const lines = text =>
+      text.split("\n").filter(line => !/^\s*\d+ \| /.test(line) && !/^\s*\^\s*$/.test(line) && !/^\s+at /.test(line));
+    expect({ lines: lines(a.stderr), renders: renders(a.stderr), exitCode: a.exitCode }).toEqual({
+      lines: lines(c.stderr),
+      renders: chain(4),
+      exitCode: 1,
+    });
+  });
+});

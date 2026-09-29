@@ -5871,11 +5871,35 @@ impl VirtualMachine {
         &mut self,
         value: JSValue,
         exception: Option<&Exception>,
+        exception_list: Option<&mut ExceptionList>,
+        formatter: &mut crate::console_object::Formatter,
+        writer: &mut bun_core::io::Writer,
+        allow_ansi_color: bool,
+        allow_side_effects: bool,
+    ) {
+        self.print_errorlike_object_with_header(
+            value,
+            exception,
+            exception_list,
+            formatter,
+            writer,
+            allow_ansi_color,
+            allow_side_effects,
+            false,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn print_errorlike_object_with_header(
+        &mut self,
+        value: JSValue,
+        exception: Option<&Exception>,
         mut exception_list: Option<&mut ExceptionList>,
         formatter: &mut crate::console_object::Formatter,
         writer: &mut bun_core::io::Writer,
         allow_ansi_color: bool,
         allow_side_effects: bool,
+        aggregate_error_header_first: bool,
     ) {
         // Note: the post-print stack/exception_list block is handled at the
         // tail instead of via a drop guard (the body has no early-`?` returns
@@ -5896,7 +5920,7 @@ impl VirtualMachine {
         if let Some(errors) = errors {
             let members_past_cap =
                 formatter.depth.saturating_add(1) > formatter.error_chain_max_depth();
-            if members_past_cap {
+            if members_past_cap || aggregate_error_header_first {
                 self.print_error_from_maybe_private_data(
                     value,
                     exception_list.as_deref_mut(),
@@ -5985,7 +6009,7 @@ impl VirtualMachine {
             {
                 global_ref.clear_exception();
             }
-            if ctx.printed_member || members_past_cap {
+            if ctx.printed_member || members_past_cap || aggregate_error_header_first {
                 return;
             }
             // `errors` is empty or not iterable: print the AggregateError itself.
@@ -7065,8 +7089,9 @@ impl VirtualMachine {
                 }
 
                 let kind = value.js_type();
-                if kind == JSType::ErrorInstance && !prev_had_errors {
-                    if field.eq_ascii(b"cause") {
+                let is_cause = field.eq_ascii(b"cause");
+                if kind == JSType::ErrorInstance && (is_cause || !prev_had_errors) {
+                    if is_cause {
                         saw_cause = true;
                     }
                     value.protect();
@@ -7225,6 +7250,18 @@ impl VirtualMachine {
             let over_cap = formatter.depth > formatter.error_chain_max_depth();
             let result: crate::CrateResult<()> = if over_cap {
                 pretty_write!(writer, "<r><cyan>[Error ...]<r>").map_err(Into::into)
+            } else if err.is_aggregate_error(global_ref) {
+                self.print_errorlike_object_with_header(
+                    err,
+                    None,
+                    exception_list.as_deref_mut(),
+                    formatter,
+                    writer,
+                    allow_ansi_color,
+                    allow_side_effects,
+                    true,
+                );
+                Ok(())
             } else {
                 self.print_error_instance_js(
                     err,
